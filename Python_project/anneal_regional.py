@@ -38,6 +38,9 @@ PEAK_COST_KM = 1000.0      # km of day radius a 100% peak reduction is worth (0 
 SPREAD_TOLERANCE = 0.05    # busiest minus quietest day, as a share of the average day
 SPREAD_PENALTY = 500.0     # km added per 100% of spread excess above the tolerance
 
+SPACING_DAYS_KM = 5.0      # km per unit of uneven spacing between a group's delivery days (0 = ignore)
+SPACING_IDEAL_GAP = 2      # ideal gap in days between consecutive deliveries (every other day)
+
 DAY_LOSS_KM = 10.0         # km cost per day short of a full week, averaged over kg
 MAX_DAY_COUNT = max(len(p) for p in PATTERNS)   # 3 with the current rules
 
@@ -62,6 +65,15 @@ def service_score(pattern):
         score -= 3      # allowed, but the weekend gap ranks lower
     return score
 
+def spacing_penalty(pattern):
+    """Average distance of the gaps between a pattern's days from the ideal gap.
+    Mon/Wed/Fri = 0, Mon/Thu = 1, Mon/Fri = 2, Mon/Tue/Wed = 1."""
+    idx = sorted(DAYS.index(d) for d in pattern)
+    gaps = [b - a for a, b in zip(idx, idx[1:])]
+    return sum(abs(g - SPACING_IDEAL_GAP) for g in gaps) / len(gaps)
+
+
+SPACING_PEN = {p: spacing_penalty(p) for p in PATTERNS}
 
 def assign_patterns(df, labels):
     w = df["Weight"].to_numpy()
@@ -225,22 +237,25 @@ def evaluate(choice, group_rows, M, n, xy, limit):
     spread = (peak - day_tot.min()) / day_tot.mean()
     dr = day_radius_km(full, xy)
 
-    # kg-weighted average number of delivery days across the depot
-    total_kg, weighted_days = 0.0, 0.0
+    # kg-weighted average number of delivery days, and spacing penalty, across the depot
+    total_kg, weighted_days, weighted_spacing = 0.0, 0.0, 0.0
     for r, pi in enumerate(choice):
         p = PATTERNS[pi]
         kg = M[(r, p)].sum()
         total_kg += kg
         weighted_days += len(p) * kg
+        weighted_spacing += SPACING_PEN[p] * kg
     avg_days = weighted_days / total_kg if total_kg else 0.0
+    spacing = weighted_spacing / total_kg if total_kg else 0.0
     service = DAY_LOSS_KM * (MAX_DAY_COUNT - avg_days)
 
     peak_excess = max(0.0, peak / limit - 1)
     spread_excess = max(0.0, spread - SPREAD_TOLERANCE)
-    cost = (dr + service + PEAK_COST_KM * peak / limit
+    cost = (dr + service + SPACING_DAYS_KM * spacing
+            + PEAK_COST_KM * peak / limit
             + PEAK_PENALTY * peak_excess + SPREAD_PENALTY * spread_excess)
     return {"cost": cost, "dr": dr, "peak": peak, "spread": spread,
-            "avg_days": avg_days,
+            "avg_days": avg_days, "spacing": spacing,
             "feasible": peak <= limit and spread <= SPREAD_TOLERANCE}
 
 
@@ -440,7 +455,7 @@ def run_depot(df, depot_name):
         choice, res = anneal(R, group_rows, M, n, xy, limit, rng)
         print(f"  restart {rs + 1}: day radius {res['dr']:.2f} km, "
               f"peak {res['peak']:,.0f} kg, spread {res['spread']:.1%}, "
-              f"avg days {res['avg_days']:.2f}, "
+              f"avg days {res['avg_days']:.2f}, spacing {res['spacing']:.2f}, "
               f"{'within' if res['feasible'] else 'over'} limits")
         if best is None or better(res, best):
             best_choice, best = choice, res
