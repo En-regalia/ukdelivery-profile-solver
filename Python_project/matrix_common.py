@@ -7,7 +7,7 @@ import pandas as pd
 from sklearn.neighbors import NearestNeighbors
 
 # ---- Shared settings ------------------------------------------------------
-MATRIX_PATH = r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\Porject Swichback\Matix files\Matrix V1.csv"
+MATRIX_PATH = r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\project_swichback\Matix files\Matrix V1.csv"
 SHEET_NAME = 0            # used only if the matrix is an Excel file
 
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]

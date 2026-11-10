@@ -1,10 +1,11 @@
 """Simulated annealing for the regional day-pattern method.
 
-Out-of-area letters are removed first (external pallet network). Weighted
-letters are grouped geographically, then one day pattern is searched per group.
-Cost = day radius + service term (days per week) + penalties for exceeding the
-peak limit or for uneven days. The peak limit is the Letters method's peak,
-calculated at run time from the same active districts.
+Runs one depot, or every depot when DEPOT_NAME is None. Remote letters (far from
+the depot's main body with few weighted districts) are removed as external.
+Weighted letters are grouped geographically, then one day pattern is searched
+per group. Cost = day radius + peak term + service term (days per week) +
+penalties. The peak limit is the Letters method's peak, calculated at run time
+from the same active districts.
 """
 import math
 import os
@@ -15,29 +16,33 @@ import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
 
-from matrix_common import (MATRIX_PATH, AREA, DEPOT, DAYS, EAST, NORTH,
-                           NEIGHBOURS, PATTERNS, district_new_loads, load_matrix,
-                           build_adjacency)
-from balence_greedyV1 import (find_outliers, zones_letters,
-                              evaluate as letters_evaluate)
+from matrix_common import (MATRIX_PATH, AREA, DAYS, DEPOT, EAST, NORTH,
+                           PATTERNS, district_new_loads, load_matrix, zone_loads)
+
 
 # ---- Settings -------------------------------------------------------------
-DEPOT_NAME = "Watford"
-OUTPUT_DIR = Path(r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\Porject Swichback\Matix files\Output")
+DEPOT_NAME = None          # a depot name, or None = every depot
+OUTPUT_DIR = Path(r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\project_swichback\Matix files\Output")
 RUN_STAMP = datetime.now().strftime("%Y-%m-%d_%H-%M")   # set when the script starts
 
-# Out-of-area letters: external pallet network, removed before planning
-EXTERNAL_LETTERS = ["BB", "CA", "DH", "EH", "G", "L", "LS", "ML", "SK", "LE", "LN"]
+# Remote letters: weighted centre further than REMOTE_KM from the depot's main
+# body, and fewer than MIN_DISTRICTS weighted districts, are treated as external
+REMOTE_KM = 150.0
+MIN_DISTRICTS = 2
 
 GROUP_SIZE = 3             # about this many letter zones per group
 PEAK_TOLERANCE = 0.03      # peak may rise this far above the Letters baseline peak
 PEAK_PENALTY = 500.0       # km added per 100% of peak excess above the limit
+PEAK_COST_KM = 1000.0      # km of day radius a 100% peak reduction is worth (0 = ignore)
 
 SPREAD_TOLERANCE = 0.05    # busiest minus quietest day, as a share of the average day
 SPREAD_PENALTY = 500.0     # km added per 100% of spread excess above the tolerance
 
 DAY_LOSS_KM = 10.0         # km cost per day short of a full week, averaged over kg
 MAX_DAY_COUNT = max(len(p) for p in PATTERNS)   # 3 with the current rules
+
+ISOLATION_KM = None        # e.g. 10 excludes districts averaging over 10 km to neighbours
+PERCENTILE = 98            # used when ISOLATION_KM is None
 
 MAX_COPY_KM = 15.0         # zero-volume codes further than this get no days
 
@@ -46,8 +51,76 @@ RESTARTS = 5
 T_START = 10.0             # km: early moves may worsen the cost by about this much
 T_END = 0.05               # km: late moves must almost always improve
 SEED = 0
-AUTO_OPEN = True
+AUTO_OPEN = True           # opens the workbook only when a single depot is run
 
+from sklearn.neighbors import NearestNeighbors
+
+# ---- Local helpers -----------------------------------------------------------
+def service_score(pattern):
+    score = len(pattern) * 10
+    if set(pattern) == {"Monday", "Friday"}:
+        score -= 3      # allowed, but the weekend gap ranks lower
+    return score
+
+
+def assign_patterns(df, labels):
+    w = df["Weight"].to_numpy()
+    zone_idx = {z: np.flatnonzero(labels == z) for z in pd.unique(labels)}
+    order = sorted(zone_idx, key=lambda z: -w[zone_idx[z]].sum())
+    load = {d: 0.0 for d in DAYS}
+    zone_pattern = {}
+    for z in order:
+        rows = df.iloc[zone_idx[z]]
+        best = None
+        for p in PATTERNS:
+            trial = zone_loads(rows, p)
+            new = {d: load[d] + trial[d] for d in DAYS}
+            key = (max(new.values()), -service_score(p),
+                   max(new.values()) - min(new.values()))
+            if best is None or key < best[0]:
+                best = (key, p, trial)
+        _, pattern, trial = best
+        zone_pattern[z] = pattern
+        for d in DAYS:
+            load[d] += trial[d]
+    return zone_pattern, load
+
+
+def letters_baseline_peak(active):
+    labels = active["Letters"].to_numpy(dtype=object)
+    _, load = assign_patterns(active, labels)
+    return max(load.values())
+
+
+def find_outliers(df):
+    """Districts far from their nearest neighbours, or from their letter's centre."""
+    active = df[df["Weight"] > 0].copy()
+    if len(active) < 6:
+        return pd.DataFrame()
+
+    xy = active[[EAST, NORTH]].to_numpy()
+    nn = NearestNeighbors(n_neighbors=5).fit(xy)
+    dist, _ = nn.kneighbors(xy)
+    active["Isolation km"] = dist[:, 1:].mean(axis=1) / 1000
+
+    cx, cy = {}, {}
+    for letter, g in active.groupby("Letters"):
+        cx[letter] = np.average(g[EAST], weights=g["Weight"])
+        cy[letter] = np.average(g[NORTH], weights=g["Weight"])
+    active["Centre dist km"] = (np.hypot(
+        active[EAST] - active["Letters"].map(cx),
+        active[NORTH] - active["Letters"].map(cy)) / 1000)
+
+    threshold = (ISOLATION_KM if ISOLATION_KM is not None
+                 else np.percentile(active["Isolation km"], PERCENTILE))
+    out = active[active["Isolation km"] > threshold].copy()
+    out["Threshold km"] = round(threshold, 1)
+    out = out.sort_values("Isolation km", ascending=False)
+    out = out[[AREA, DEPOT, "Letters", "Weight", "Isolation km",
+               "Centre dist km", "Threshold km"]].round(
+        {"Weight": 0, "Isolation km": 1, "Centre dist km": 1})
+    out["Status"] = "Excluded - no days assigned"
+    return out
 
 # ---- Day radius -----------------------------------------------------------
 def day_radius_km(M, xy):
@@ -62,6 +135,28 @@ def day_radius_km(M, xy):
         total += (w * np.hypot(xy[:, 0] - cx, xy[:, 1] - cy)).sum()
         kg += s
     return total / kg / 1000 if kg else 0.0
+
+
+# ---- Remote letters -------------------------------------------------------
+def find_remote_letters(depot_all):
+    """Letters far from the depot's main body. Those with fewer weighted
+    districts than MIN_DISTRICTS are external; the rest are kept in the plan."""
+    lab = depot_all[depot_all["Weight"] > 0].copy()
+    lab["wx"] = lab[EAST] * lab["Weight"]
+    lab["wy"] = lab[NORTH] * lab["Weight"]
+    lc = lab.groupby("Letters").agg(
+        wx=("wx", "sum"), wy=("wy", "sum"),
+        kg=("Weight", "sum"), districts=(AREA, "count"))
+    lc["x"] = lc["wx"] / lc["kg"]
+    lc["y"] = lc["wy"] / lc["kg"]
+    main_c = np.average(lc[["x", "y"]].to_numpy(), axis=0,
+                        weights=lc["kg"].to_numpy())
+    lc["km"] = np.hypot(lc["x"] - main_c[0], lc["y"] - main_c[1]) / 1000
+
+    remote = lc[lc["km"] > REMOTE_KM]
+    external = list(remote.index[remote["districts"] < MIN_DISTRICTS])
+    kept = list(remote.index[remote["districts"] >= MIN_DISTRICTS])
+    return external, kept
 
 
 # ---- Grouping (weighted letters only; zero-weight letters join afterwards) -
@@ -142,8 +237,8 @@ def evaluate(choice, group_rows, M, n, xy, limit):
 
     peak_excess = max(0.0, peak / limit - 1)
     spread_excess = max(0.0, spread - SPREAD_TOLERANCE)
-    cost = (dr + service + PEAK_PENALTY * peak_excess
-            + SPREAD_PENALTY * spread_excess)
+    cost = (dr + service + PEAK_COST_KM * peak / limit
+            + PEAK_PENALTY * peak_excess + SPREAD_PENALTY * spread_excess)
     return {"cost": cost, "dr": dr, "peak": peak, "spread": spread,
             "avg_days": avg_days,
             "feasible": peak <= limit and spread <= SPREAD_TOLERANCE}
@@ -179,7 +274,8 @@ def anneal(R, group_rows, M, n, xy, limit, rng):
 
 # ---- Outputs --------------------------------------------------------------
 def write_outputs(depot_df, active, zero, excluded, outliers, groups,
-                  group_pattern, letter_group, best, xy, reference_peak):
+                  group_pattern, letter_group, best, xy, reference_peak,
+                  depot_name):
     load = {d: 0.0 for d in DAYS}
     active_days, district_rows, map_rows = [], [], []
 
@@ -260,6 +356,7 @@ def write_outputs(depot_df, active, zero, excluded, outliers, groups,
                               "After kg": round(load[d], 0)} for d in DAYS])
 
     summary = pd.DataFrame([{
+        "Depot": depot_name,
         "Groups": len(groups), "Group size": GROUP_SIZE,
         "Day radius km": round(best["dr"], 2),
         "Peak kg": round(best["peak"], 0),
@@ -272,7 +369,7 @@ def write_outputs(depot_df, active, zero, excluded, outliers, groups,
     }])
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out = OUTPUT_DIR / f"Anneal_{DEPOT_NAME.replace(' ', '_')}_Regional_{RUN_STAMP}.xlsx"
+    out = OUTPUT_DIR / f"Anneal_{depot_name.replace(' ', '_')}_Regional_{RUN_STAMP}.xlsx"
     with pd.ExcelWriter(out) as xl:
         summary.to_excel(xl, sheet_name="Summary", index=False)
         pd.DataFrame(group_rows).to_excel(xl, sheet_name="Groups", index=False)
@@ -281,45 +378,50 @@ def write_outputs(depot_df, active, zero, excluded, outliers, groups,
         daily_df.to_excel(xl, sheet_name="Daily loads", index=False)
         outliers.to_excel(xl, sheet_name="Outliers", index=False)
     print(f"Saved {out}")
-    if AUTO_OPEN:
-        try:
-            os.startfile(out)
-        except OSError as e:
-            print(f"Could not open {out}: {e}")
+    return out
 
 
-# ---- Main -----------------------------------------------------------------
-def main():
-    df = load_matrix(MATRIX_PATH)
-    df["Letters"] = df[AREA].str.extract(r"^([A-Z]+)")[0]
-    depot_all = df[df[DEPOT] == DEPOT_NAME].reset_index(drop=True)
+# ---- Per-depot run --------------------------------------------------------
+def run_depot(df, depot_name):
+    depot_all = df[df[DEPOT] == depot_name].reset_index(drop=True)
+    if depot_all.empty:
+        print(f"\n{depot_name}: no rows, skipping")
+        return None
 
-    # Out-of-area letters go to the external pallet network: removed from the plan
-    is_ext = depot_all["Letters"].isin(EXTERNAL_LETTERS)
+    # Remote letters: far from the main body with few weighted districts
+    ext_list, kept = find_remote_letters(depot_all)
+    print(f"\n{'=' * 60}\n{depot_name}")
+    print(f"Removed as external: {ext_list or 'none'}")
+    print(f"Far but kept (several districts): {kept or 'none'}")
+
+    is_ext = depot_all["Letters"].isin(ext_list)
     external = depot_all[is_ext & (depot_all["Weight"] > 0)][
         [AREA, DEPOT, "Letters", "Weight"]].copy()
-    external["Status"] = "External pallet network - not in plan"
+    external["Status"] = "External pallet network - review"
     external_kg = external["Weight"].sum()
     depot_df = depot_all[~is_ext].reset_index(drop=True)
 
     weighted = depot_df[depot_df["Weight"] > 0].reset_index(drop=True)
     zero = depot_df[depot_df["Weight"] <= 0].reset_index(drop=True)
+    if weighted.empty:
+        print(f"{depot_name}: no weighted districts, skipping")
+        return None
 
     # Isolation outliers (excluded from the plan, listed on the Outliers tab)
     outliers = find_outliers(weighted)
     excluded_names = set(outliers[AREA]) if not outliers.empty else set()
     excluded = weighted[weighted[AREA].isin(excluded_names)].reset_index(drop=True)
     active = weighted[~weighted[AREA].isin(excluded_names)].reset_index(drop=True)
+    if active.empty:
+        print(f"{depot_name}: all districts excluded, skipping")
+        return None
 
     outliers = pd.concat([outliers, external], ignore_index=True)
-    print(f"External pallet network: {len(external)} weighted districts, "
+    print(f"External pallet network: {len(external)} districts, "
           f"{external_kg:,.0f} kg removed from the plan")
 
-    # Baseline: the Letters method on exactly the same active districts
-    adj = build_adjacency(active[[EAST, NORTH]].to_numpy(), NEIGHBOURS)
-    letters_labels = zones_letters(active, active["Weight"].sum(), adj)
-    letters_metrics, _ = letters_evaluate(active, letters_labels, adj)
-    reference_peak = letters_metrics["Peak kg"]
+    # Peak limit: Letters baseline on exactly the same active districts
+    reference_peak = letters_baseline_peak(active)
     limit = reference_peak * (1 + PEAK_TOLERANCE)
     print(f"Letters baseline peak: {reference_peak:,.0f} kg")
 
@@ -329,7 +431,7 @@ def main():
     groups, idx_by_zone = build_groups(active, depot_df)
     group_rows, M = precompute(active, groups, idx_by_zone)
     R = len(groups)
-    print(f"{DEPOT_NAME}: {len(idx_by_zone)} weighted letters, {R} groups, "
+    print(f"{len(idx_by_zone)} weighted letters, {R} groups, "
           f"peak limit {limit:,.0f} kg")
 
     rng = np.random.default_rng(SEED)
@@ -353,8 +455,32 @@ def main():
         print(f"  Group {r + 1}: {', '.join(sorted(zs))} -> "
               f"{', '.join(group_pattern[r])}")
 
-    write_outputs(depot_df, active, zero, excluded, outliers, groups,
-                  group_pattern, letter_group, best, xy, reference_peak)
+    return write_outputs(depot_df, active, zero, excluded, outliers, groups,
+                         group_pattern, letter_group, best, xy, reference_peak,
+                         depot_name)
+
+
+# ---- Main -----------------------------------------------------------------
+def main():
+    df = load_matrix(MATRIX_PATH)
+    df["Letters"] = df[AREA].str.extract(r"^([A-Z]+)")[0]
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    depots = sorted(df[DEPOT].unique()) if DEPOT_NAME is None else [DEPOT_NAME]
+    print(f"Depots to run: {', '.join(depots)}")
+
+    outputs = []
+    for depot in depots:
+        out = run_depot(df, depot)
+        if out is not None:
+            outputs.append(out)
+
+    print(f"\nFinished: {len(outputs)} of {len(depots)} depots saved")
+    if AUTO_OPEN and len(outputs) == 1:
+        try:
+            os.startfile(outputs[0])
+        except OSError as e:
+            print(f"Could not open {outputs[0]}: {e}")
 
 
 if __name__ == "__main__":
