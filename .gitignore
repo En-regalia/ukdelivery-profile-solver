@@ -1,15 +1,29 @@
 # Created by venv; see https://docs.python.org/3/library/venv.html
 
+# Local environment files
+env/
+.env
+
 # ignore Excel and CSV data files
 *.xlsx
 *.csv
 
-# Local presentation files
+# Local presentation & Archive files
 presentation/
 .presentation/
+/Archive/
+
+# local development test files
+test_files/
+.test_files/
+
+# Raw data files
+data/
+.data/
 
 #ONS data file guides
 *.pdf
+*.odt
 
 # Ignore Python cache files
 __pycache__/
@@ -19,6 +33,3 @@ __pycache__/
 venv/
 .venv/
 
-# local development test files
-test_files/
-.test_files/
