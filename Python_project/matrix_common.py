@@ -7,7 +7,7 @@ import pandas as pd
 from sklearn.neighbors import NearestNeighbors
 
 # ---- Shared settings ------------------------------------------------------
-MATRIX_PATH = r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\project_swichback\Matix files\Matrix V1.csv"
+
 SHEET_NAME = 0            # used only if the matrix is an Excel file
 
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
@@ -19,6 +19,30 @@ NORTH = "GRIDN_Ave"
 MAX_DAYS = 3              # maximum number of days in a pattern
 NEIGHBOURS = 4            # a district is "next to" its 4 nearest districts
 
+# ---- Matrix sources -------------------------------------------------------
+MATRIX_OPTIONS = {
+    "1": ("Built matrix (build_matrix output)",
+          Path(r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\project_swichback\Python_project\Data\Matrix_output\MatrixV2.csv")),
+    "2": ("Existing matrix (Matrix V1)",
+          Path(r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\project_swichback\Matix files\Matrix V1.csv")),
+}
+
+
+def select_matrix_path():
+    """Ask in the terminal which matrix to use. Repeats until a valid, existing file is chosen."""
+    print("\nWhich matrix should the solver use?")
+    for key, (label, path) in MATRIX_OPTIONS.items():
+        print(f"  {key}. {label}\n     {path}")
+    while True:
+        choice = input("Enter 1 or 2: ").strip()
+        if choice not in MATRIX_OPTIONS:
+            print("Please enter 1 or 2.")
+            continue
+        path = MATRIX_OPTIONS[choice][1]
+        if not path.exists():
+            print(f"File not found: {path}")
+            continue
+        return path
 
 # ---- Patterns -------------------------------------------------------------
 def adjacent_pairs(pattern):

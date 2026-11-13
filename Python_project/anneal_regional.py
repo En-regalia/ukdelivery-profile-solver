@@ -16,8 +16,9 @@ import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
 
-from matrix_common import (MATRIX_PATH, AREA, DAYS, DEPOT, EAST, NORTH,
-                           PATTERNS, district_new_loads, load_matrix, zone_loads)
+from matrix_common import (AREA, DAYS, DEPOT, EAST, NORTH,
+                           PATTERNS, district_new_loads, load_matrix,
+                           select_matrix_path, zone_loads)
 
 
 # ---- Settings -------------------------------------------------------------
@@ -290,7 +291,7 @@ def anneal(R, group_rows, M, n, xy, limit, rng):
 # ---- Outputs --------------------------------------------------------------
 def write_outputs(depot_df, active, zero, excluded, outliers, groups,
                   group_pattern, letter_group, best, xy, reference_peak,
-                  depot_name):
+                  depot_name, run_dir):
     load = {d: 0.0 for d in DAYS}
     active_days, district_rows, map_rows = [], [], []
 
@@ -383,8 +384,8 @@ def write_outputs(depot_df, active, zero, excluded, outliers, groups,
         "Restarts": RESTARTS, "Iterations per restart": ITERATIONS,
     }])
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out = OUTPUT_DIR / f"Anneal_{depot_name.replace(' ', '_')}_Regional_{RUN_STAMP}.xlsx"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    out = run_dir / f"Anneal_{depot_name.replace(' ', '_')}_Regional_{RUN_STAMP}.xlsx"
     with pd.ExcelWriter(out) as xl:
         summary.to_excel(xl, sheet_name="Summary", index=False)
         pd.DataFrame(group_rows).to_excel(xl, sheet_name="Groups", index=False)
@@ -397,7 +398,7 @@ def write_outputs(depot_df, active, zero, excluded, outliers, groups,
 
 
 # ---- Per-depot run --------------------------------------------------------
-def run_depot(df, depot_name):
+def run_depot(df, depot_name, run_dir):
     depot_all = df[df[DEPOT] == depot_name].reset_index(drop=True)
     if depot_all.empty:
         print(f"\n{depot_name}: no rows, skipping")
@@ -472,30 +473,45 @@ def run_depot(df, depot_name):
 
     return write_outputs(depot_df, active, zero, excluded, outliers, groups,
                          group_pattern, letter_group, best, xy, reference_peak,
-                         depot_name)
+                         depot_name, run_dir)
 
 
 # ---- Main -----------------------------------------------------------------
 def main():
-    df = load_matrix(MATRIX_PATH)
+    matrix_path = select_matrix_path()
+    print(f"Using matrix: {matrix_path}")
+    df = load_matrix(matrix_path)
     df["Letters"] = df[AREA].str.extract(r"^([A-Z]+)")[0]
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     depots = sorted(df[DEPOT].unique()) if DEPOT_NAME is None else [DEPOT_NAME]
     print(f"Depots to run: {', '.join(depots)}")
 
+    # One dated folder per multi-depot run; a single depot saves to the output folder
+    if len(depots) > 1:
+        run_dir = OUTPUT_DIR / f"Run_{RUN_STAMP}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Saving this run to: {run_dir}")
+    else:
+        run_dir = OUTPUT_DIR
+
     outputs = []
     for depot in depots:
-        out = run_depot(df, depot)
+        out = run_depot(df, depot, run_dir)
         if out is not None:
             outputs.append(out)
 
-    print(f"\nFinished: {len(outputs)} of {len(depots)} depots saved")
+    print(f"\nFinished: {len(outputs)} of {len(depots)} depots saved to {run_dir}")
     if AUTO_OPEN and len(outputs) == 1:
         try:
             os.startfile(outputs[0])
         except OSError as e:
             print(f"Could not open {outputs[0]}: {e}")
+    elif AUTO_OPEN and len(outputs) > 1:
+        try:
+            os.startfile(run_dir)      # open the folder so all files are visible
+        except OSError as e:
+            print(f"Could not open {run_dir}: {e}")
 
 
 if __name__ == "__main__":
