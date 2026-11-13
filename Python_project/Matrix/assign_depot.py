@@ -1,22 +1,28 @@
-"""Assign each postcode area to the depot with the shortest straight-line
-distance on the British National Grid. A bonus (km) keeps the current depot
-unless another depot is clearly closer."""
+#"""Assign each postcode area to the depot with the shortest straight-line distance on the British National Grid. A bonus (km) keeps the current depot unless another depot is clearly closer."""
+
+
+import os
+from dotenv import load_dotenv
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 # ---- Settings -------------------------------------------------------------
-DEPOT_PATH = Path(r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\project_swichback\Python_project\Matrix\postcode_depot.csv")
-DEPOT_INFO_PATH = Path(r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\project_swichback\Python_project\Matrix\depot_info.csv")
-DEPOT_OUT = Path(r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\project_swichback\Python_project\Matrix\postcode_depot_assigned.csv")
+load_dotenv()
+
+DEPOT_PATH = Path(os.environ["DEPOT_PATH"])
+DEPOT_INFO_PATH = Path(os.environ["DEPOT_INFO_PATH"])
+DEPOT_OUT = Path(os.environ["DEPOT_OUT"])
 
 AREA = "Postcode Area"
 DEPOT = "Depot"
 EAST, NORTH = "GRIDE_Ave", "GRIDN_Ave"
 
 PREFERRED_BONUS_KM = 15     # current depot treated as this many km closer
-MAX_KM = 60                 # flag areas further than this from their chosen depot
+MAX_KM = 150                 # flag areas further than this from their chosen depot
+
+locked = {"Bristol Outbase"}  # areas that are locked to their current depot
 
 
 # ---- Helpers --------------------------------------------------------------
@@ -60,6 +66,18 @@ def assign_depots(helper, depot_xy):
     score = dist.copy()
     for j, n in enumerate(names):
         score[helper[DEPOT].to_numpy() == n, j] -= PREFERRED_BONUS_KM
+
+    for i in range(len(helper)):
+        current_depot = helper.iloc[i][DEPOT]
+        cd_column = names.index(current_depot)
+        if current_depot in locked:
+            score[i,cd_column] = -np.inf
+        else:
+            for d in locked:
+                locked_column = names.index(d)
+                score[i,locked_column] = np.inf
+
+                    
 
     best = score.argmin(axis=1)
     out = helper.copy()

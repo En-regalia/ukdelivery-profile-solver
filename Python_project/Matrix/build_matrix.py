@@ -1,14 +1,18 @@
 """Build the day-volume Matrix file the anneal solver reads.
 One row per postcode area in the depot helper file, with kg per weekday."""
+import os
+from dotenv import load_dotenv
+
 from pathlib import Path
 
 import pandas as pd
+import glob
 
 # ---- Settings -------------------------------------------------------------
-ORDERS_PATH = Path(r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\project_swichback\Python_project\Data\Consolidation_output\raw_orders_consolidated.csv")
-DEPOT_PATH = Path(r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\project_swichback\Python_project\Matrix\postcode_depot.csv")
-MATRIX_OUT = Path(r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\project_swichback\Python_project\Data\Matrix_output\MatrixV2.csv")
-CHECK_OUT = Path(r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\project_swichback\Python_project\Data\Matrix_output\unassigned_areas.csv")
+ORDERS_PATH = Path(os.environ["ORDERS_PATH"])
+DEPOT_ASSIGNED = Path(os.environ["DEPOT_ASSIGNED"])
+MATRIX_OUT = Path(os.environ["MATRIX_OUT"])
+CHECK_OUT = Path(os.environ["CHECK_OUT"])
 
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
 AREA = "Postcode Area"
@@ -38,7 +42,7 @@ def to_num(s):
 # ---- Main -----------------------------------------------------------------
 def main():
     orders = read_csv_any(ORDERS_PATH)
-    helper = read_csv_any(DEPOT_PATH)
+    helper = read_csv_any(DEPOT_ASSIGNED)
 
     for col in [AREA, DEPOT, EAST, NORTH]:
         if col not in helper.columns:
