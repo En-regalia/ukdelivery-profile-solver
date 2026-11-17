@@ -147,3 +147,44 @@ def count_disconnected(labels, adj):
         if len(seen) < len(members):
             bad += 1
     return bad
+
+def loop_km(order, d):
+    n = len(order)
+    return sum(d[order[k], order[(k + 1) % n]] for k in range(n))
+
+
+def two_opt(order, d):
+    n = len(order)
+    improved = True
+    while improved:
+        improved = False
+        for i in range(1, n - 1):
+            for j in range(i + 1, n):
+                a, b = order[i - 1], order[i]
+                c, e = order[j], order[(j + 1) % n]
+                if d[a, b] + d[c, e] > d[a, c] + d[b, e] + 1e-9:
+                    order[i:j + 1] = order[i:j + 1][::-1]
+                    improved = True
+    return order
+
+
+def closed_tour_km(pts, starts=20):
+    """Closed loop through the points in km (heuristic). Points with no grid reference are ignored."""
+    pts = pts[(pts[:, 0] > 0) & (pts[:, 1] > 0)]
+    n = len(pts)
+    if n < 2:
+        return 0.0
+    d = np.hypot(pts[:, None, 0] - pts[None, :, 0],
+                 pts[:, None, 1] - pts[None, :, 1]) / 1000
+    best = None
+    for start in range(min(n, starts)):
+        left = set(range(n)) - {start}
+        order = [start]
+        while left:
+            nxt = min(left, key=lambda k: d[order[-1], k])
+            order.append(nxt)
+            left.remove(nxt)
+        length = loop_km(order, d)
+        if best is None or length < best[0]:
+            best = (length, order)
+    return loop_km(two_opt(best[1], d), d)

@@ -11,28 +11,19 @@ import math
 import os
 from datetime import datetime
 from pathlib import Path
-from dotenv import load_dotenv
 
 import numpy as np
 import pandas as pd
-from sklearn.neighbors import NearestNeighbors
 from sklearn.cluster import KMeans
-from openpyxl import load_workbook
-from openpyxl.drawing.image import Image as XLImage
-
-import matplotlib
-matplotlib.use("Agg")                  # Stop pop ups when running in a terminal
-import matplotlib.pyplot as plt
-import geopandas as gpd
 
 from matrix_common import (AREA, DAYS, DEPOT, EAST, NORTH,
                            PATTERNS, district_new_loads, load_matrix,
-                           select_matrix_path, zone_loads)
+                           select_matrix_path, zone_loads,closed_tour_km)
 
 
 # ---- Settings -------------------------------------------------------------
 DEPOT_NAME = None          # a depot name, or None = every depot
-
+OUTPUT_DIR = Path(r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\project_swichback\Matix files\Output")
 RUN_STAMP = datetime.now().strftime("%Y-%m-%d_%H-%M")   # set when the script starts
 
 # Remote letters: weighted centre further than REMOTE_KM from the depot's main
@@ -66,14 +57,19 @@ T_END = 0.05               # km: late moves must almost always improve
 SEED = 0
 AUTO_OPEN = True           # opens the workbook only when a single depot is run
 
-MAKE_MAPS = True
-MAP_DPI = 150
+# ---- Route length cap -----------------------------------------------------
+# Baseline = 95th percentile of planned route lengths per depot (route_baseline.py)
+ROUTE_BASELINE_KM = {
+    "Bristol Outbase": 494.3,
+    "Doncaster": 343.0,
+    "Warrington": 348.1,
+    "Watford": 476.4,
+}
+ROUTE_TOLERANCE = 0.00      # allowance above the baseline: 0.10 = 10% over
+KG_TOLERANCE = 0.10         # a group's kg may differ from the target by this share
+TOUR_STARTS = 20            # starting points tried per route (speed vs accuracy)
 
-# ---- env variables -----------------------------------------------------------
-load_dotenv()
-
-OUTPUT_DIR = Path(os.getenv("A_OUTPUT_DIR"))
-UK_OUTLINE_PATH = Path(os.getenv("MAP_IMAGE_PATH")) if os.getenv("MAP_IMAGE_PATH") else None   # loaded from env var or None for dots only
+from sklearn.neighbors import NearestNeighbors
 
 # ---- Local helpers -----------------------------------------------------------
 def service_score(pattern):
@@ -151,6 +147,13 @@ def find_outliers(df):
     out["Status"] = "Excluded - no days assigned"
     return out
 
+def route_cap_km(depot_name):
+    base = ROUTE_BASELINE_KM.get(depot_name)
+    if base is None:
+        print(f"No route baseline for {depot_name}: route cap not applied")
+        return None
+    return base * (1 + ROUTE_TOLERANCE)
+
 # ---- Day radius -----------------------------------------------------------
 def day_radius_km(M, xy):
     total, kg = 0.0, 0.0
@@ -189,38 +192,80 @@ def find_remote_letters(depot_all):
 
 
 # ---- Grouping (weighted letters only; zero-weight letters join afterwards) -
-def build_groups(active, df):
+def build_groups(active, df, cap_km):
+    """Letter zones grouped to a similar kg each. Any group whose loop is over cap_km is split."""
     w = active["Weight"].to_numpy()
     xy = active[[EAST, NORTH]].to_numpy()
     lab = active["Letters"].to_numpy()
     zones = list(pd.unique(lab))
-    idx_by_zone = {z: np.flatnonzero(lab == z) for z in zones}
-    centres = np.array([np.average(xy[idx_by_zone[z]], axis=0,
-                                   weights=w[idx_by_zone[z]]) for z in zones])
-    kgs = np.array([w[idx_by_zone[z]].sum() for z in zones])
+    idx = {z: np.flatnonzero(lab == z) for z in zones}
+    kg = {z: w[idx[z]].sum() for z in zones}
+    cen = {z: np.average(xy[idx[z]], axis=0, weights=w[idx[z]]) for z in zones}
+
+    def centre(zs):
+        return np.average([cen[z] for z in zs], axis=0, weights=[kg[z] for z in zs])
+
+    def route_km(zs):
+        rows = [i for z in zs for i in idx[z]]
+        return closed_tour_km(xy[rows], TOUR_STARTS)
 
     R = max(1, min(len(zones), round(len(zones) / GROUP_SIZE)))
-    km = KMeans(n_clusters=R, n_init=10, random_state=0)
-    km.fit(centres, sample_weight=kgs)
-    groups = [[zones[k] for k in range(len(zones)) if km.labels_[k] == r]
-              for r in range(R)]
-    group_centres = np.array([
-        np.average(centres[km.labels_ == r], axis=0,
-                   weights=kgs[km.labels_ == r])
-        for r in range(R)])
+    target = sum(kg.values()) / R
 
-    # Zero-weight letters join the nearest group centre afterwards
+    # 1. Fill groups close to the target kg, taking the nearest zones first
+    unassigned = set(zones)
+    groups = []
+    for _ in range(R):
+        if not unassigned:
+            break
+        seed = max(unassigned, key=lambda z: kg[z])
+        unassigned.discard(seed)
+        grp, total = [seed], kg[seed]
+        while total < target * (1 - KG_TOLERANCE):
+            fits = [z for z in unassigned if total + kg[z] <= target * (1 + KG_TOLERANCE)]
+            if not fits:
+                break
+            gc = centre(grp)
+            pick = min(fits, key=lambda z: np.hypot(*(cen[z] - gc)))
+            grp.append(pick)
+            total += kg[pick]
+            unassigned.discard(pick)
+        groups.append(grp)
+    for z in unassigned:                      # leftovers join the nearest group
+        r = int(np.argmin([np.hypot(*(cen[z] - centre(g))) for g in groups]))
+        groups[r].append(z)
+
+    # 2. Split any group whose loop is over the cap (letter zones are not split)
+    def split_to_cap(zs):
+        if cap_km is None or len(zs) < 2 or route_km(zs) <= cap_km:
+            if cap_km is not None and len(zs) == 1 and route_km(zs) > cap_km:
+                print(f"  Letter {zs[0]} alone is over the route cap")
+            return [zs]
+        pts = np.array([cen[z] for z in zs])
+        ws = np.array([kg[z] for z in zs])
+        km = KMeans(n_clusters=2, n_init=10, random_state=0).fit(pts, sample_weight=ws)
+        a = [z for z, l in zip(zs, km.labels_) if l == 0]
+        b = [z for z, l in zip(zs, km.labels_) if l == 1]
+        if not a or not b:
+            return [zs]
+        return split_to_cap(a) + split_to_cap(b)
+
+    groups = [part for g in groups for part in split_to_cap(g)]
+    gk = [sum(kg[z] for z in g) for g in groups]
+    print(f"  {len(groups)} groups, kg {min(gk):,.0f} to {max(gk):,.0f}")
+
+    # 3. Zero-weight letters join the nearest group centre
+    centres = np.array([centre(g) for g in groups])
     for L, g in df.groupby("Letters"):
-        if L in idx_by_zone:
+        if L in cen:
             continue
         pts = g[[EAST, NORTH]].to_numpy()
         pts = pts[(pts[:, 0] > 0) & (pts[:, 1] > 0)]
         if not len(pts):
             continue
         c = pts.mean(axis=0)
-        r = int(np.argmin(np.hypot(*(group_centres - c).T)))
-        groups[r].append(L)
-    return groups, idx_by_zone
+        groups[int(np.argmin(np.hypot(*(centres - c).T)))].append(L)
+    return groups, idx
 
 
 def precompute(active, groups, idx_by_zone):
@@ -303,65 +348,6 @@ def anneal(R, group_rows, M, n, xy, limit, rng):
                 best_choice, best = list(choice), cur
     return best_choice, best
 
-# ---- Map output -------------------------------------------------------------
-
-def load_uk_outline():
-    if not UK_OUTLINE_PATH:
-        return None
-    try:
-        return gpd.read_file(UK_OUTLINE_PATH).to_crs(27700)
-    except Exception as e:
-        print(f"Outline not loaded ({e}); maps will show dots only")
-        return None
-
-
-def plot_depot_maps(depot_name, map_rows, depot_df, out_png, outline=None):
-    """One row of five day maps for a depot, using the same data as the Map sheet."""
-    loads = pd.DataFrame(map_rows, columns=[AREA, DEPOT, "Weekday", "Weight"])
-    coords = depot_df.drop_duplicates(AREA).set_index(AREA)[[EAST, NORTH]]
-    pts = loads.join(coords, on=AREA)
-    pts = pts[(pts[EAST] > 0) & (pts[NORTH] > 0)]
-    peak = pts.loc[pts["Weight"] > 0, "Weight"].max()
-    peak = peak if peak and peak > 0 else 1.0
-
-    fig, axes = plt.subplots(1, len(DAYS), figsize=(4.2 * len(DAYS), 5.2))
-    for ax, day in zip(axes, DAYS):
-        if outline is not None:
-            outline.plot(ax=ax, color="#dedede", edgecolor="white", linewidth=0.3)
-
-        d = pts[pts["Weekday"] == day]
-        copied = d[d["Weight"] <= 0]        # zero-volume codes given the nearest district's day
-        weighted = d[d["Weight"] > 0]
-        ax.scatter(copied[EAST], copied[NORTH], s=6,
-                   color="#9cc3e6", linewidths=0)
-        ax.scatter(weighted[EAST], weighted[NORTH],
-                   s=6 + 40 * np.sqrt(weighted["Weight"] / peak),
-                   color="#1f5fa8", linewidths=0)
-
-        if outline is not None:
-            minx, miny, maxx, maxy = outline.total_bounds
-            ax.set_xlim(minx, maxx)
-            ax.set_ylim(miny, maxy)
-        ax.set_aspect("equal")
-        ax.set_axis_off()
-        kg = weighted["Weight"].sum()
-        ax.set_title(f"{day.upper()}\n{kg:,.0f} kg | {weighted[AREA].nunique()} districts",
-                     fontsize=11, fontweight="bold")
-
-    fig.suptitle(f"{depot_name} - delivery districts by day", fontsize=14, fontweight="bold")
-    fig.tight_layout(rect=[0, 0, 1, 0.92])
-    fig.savefig(out_png, dpi=MAP_DPI)
-    plt.close(fig)
-    return out_png
-
-
-def add_maps_sheet(xlsx_path, png_path, sheet="Maps"):
-    wb = load_workbook(xlsx_path)
-    ws = wb.create_sheet(sheet)
-    img = XLImage(str(png_path))
-    img.width, img.height = img.width * 0.5, img.height * 0.5
-    ws.add_image(img, "A1")
-    wb.save(xlsx_path)
 
 # ---- Outputs --------------------------------------------------------------
 def write_outputs(depot_df, active, zero, excluded, outliers, groups,
@@ -469,12 +455,6 @@ def write_outputs(depot_df, active, zero, excluded, outliers, groups,
         daily_df.to_excel(xl, sheet_name="Daily loads", index=False)
         outliers.to_excel(xl, sheet_name="Outliers", index=False)
     print(f"Saved {out}")
-
-    if MAKE_MAPS:
-        png = run_dir / f"Maps_{depot_name.replace(' ', '_')}_{RUN_STAMP}.png"
-        plot_depot_maps(depot_name, map_rows, depot_df, png, load_uk_outline())
-        add_maps_sheet(out, png)
-        print(f"Saved map {png}")
     return out
 
 
@@ -525,7 +505,7 @@ def run_depot(df, depot_name, run_dir):
     n = len(active)
     xy = active[[EAST, NORTH]].to_numpy()
 
-    groups, idx_by_zone = build_groups(active, depot_df)
+    groups, idx_by_zone = build_groups(active, depot_df, route_cap_km(depot_name))
     group_rows, M = precompute(active, groups, idx_by_zone)
     R = len(groups)
     print(f"{len(idx_by_zone)} weighted letters, {R} groups, "
