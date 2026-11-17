@@ -3,12 +3,15 @@ Unmatched orders and orders in EXCLUDE_STATES pass through unchanged."""
 from pathlib import Path
 
 import pandas as pd
+import os
+from dotenv import load_dotenv
 
 # ---- Settings -------------------------------------------------------------
-RAW_PATH = Path(r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\project_swichback\Python_project\Data\aug_oct_orders.csv")
-KEYWORD_PATH = Path(r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\project_swichback\Python_project\consolidation\builder_keywords.csv")
-OUTPUT_PATH = Path(r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\project_swichback\Python_project\Data\Consolidation_output\raw_orders_consolidated.csv")
-SUMMARY_PATH = Path(r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\project_swichback\Python_project\Data\Consolidation_output\consolidation_summary.csv")
+load_dotenv()
+RAW_PATH = Path(os.environ["RAW_PATH"])
+KEYWORD_PATH = Path(os.environ["KEYWORD_PATH"])
+OUTPUT_PATH = Path(os.environ["C_OUTPUT_PATH"])
+SUMMARY_PATH = Path(os.environ["C_SUMMARY_PATH"])
 
 # Columns searched for builder keywords (a match in any of them counts)
 MATCH_COLUMNS = ["dropoffContactName", "dropoffCustomerReference",

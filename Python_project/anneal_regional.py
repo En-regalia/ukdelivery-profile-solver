@@ -73,7 +73,7 @@ MAP_DPI = 150
 load_dotenv()
 
 OUTPUT_DIR = Path(os.getenv("A_OUTPUT_DIR"))
-UK_OUTLINE_PATH = Path(os.getenv("MAP_IMAGE_PATH")) if os.getenv("UK_OUTLINE_PATH") else None   # loaded from env var or None for dots only
+UK_OUTLINE_PATH = Path(os.getenv("MAP_IMAGE_PATH")) if os.getenv("MAP_IMAGE_PATH") else None   # loaded from env var or None for dots only
 
 # ---- Local helpers -----------------------------------------------------------
 def service_score(pattern):

@@ -8,10 +8,19 @@ env/
 *.xlsx
 *.csv
 
+# ignore png files generated from annel data files
+*.png
+
 # Local presentation & Archive files
 presentation/
 .presentation/
 /Archive/
+Excel files/
+.Excel files/
+Matrix files/
+.Matrix files/
+ONS data/
+.ONS data/
 
 # local development test files
 test_files/
