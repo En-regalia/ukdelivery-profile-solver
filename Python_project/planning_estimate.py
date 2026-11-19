@@ -6,21 +6,31 @@ For the lowest, median and peak network weeks (by kg):
 - After: each order moves to its area's new day (same rule as map_days).
   Outliers and external letters go to "Pallet network" with no vehicles.
 - Vehicles: packed per depot per day at 8000 kg / 15 pallets.
-  Stage 1 packs within each postcode area only.
-  Stage 2 merges leftover vehicles with nearby areas on the same day
-  (same letter first, then any area within CAP_KM).
+  Stage 1 packs within each postcode area (first fit, largest orders first).
+  Stage 2 empties the smallest vehicles by moving their orders into other
+  vehicles on the same day, where the load fits, the closed route stays within
+  MAX_ROUTE_KM, and the added route km is smallest.
+  Each depot's vehicle count is checked against FLEET_CAP.
 Both plans use the same packing, so the comparison is like for like.
+
+Route km (added): each packed vehicle's straight-line closed loop, depot -> stops
+-> depot, from routing.py (nearest neighbour then 2-opt). Route km includes both
+depot legs; Stop km is stop-to-stop only. Km columns are added to Weeks, Routes
+and Summary, and the Route detail sheet lists every stop. Totals only in the
+route summary; no route order sheet beyond that detail.
 """
 import os
-import re
+import random
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 
-import numpy as np
 import pandas as pd
 
-from matrix_common import AREA, DAYS, EAST, NORTH, load_matrix, map_days, select_matrix_path
+from matrix_common import AREA, DAYS, map_days
+from routing import DEPOT_KEY, load_grid_refs, route_legs, sum_route_km, vehicle_route
+from maps_common import MAP_DPI, load_uk_outline
+import matplotlib.pyplot as plt
 
 # ---- dir paths and environment variables -------------------------------------------------------------
 # set to your file
@@ -28,13 +38,26 @@ load_dotenv()
 
 ANNEAL_FOLDER = Path(os.getenv("A_OUTPUT_DIR"))        # folder with Anneal_*_Regional_*.xlsx
 OUTPUT_DIR = Path(os.getenv("P_OUTPUT_DIR"))
+SWEEP_FOLDER = Path(os.getenv("S_OUTPUT_DIR")) if os.getenv("S_OUTPUT_DIR") else None   # sweep output folder
 RUN_STAMP = datetime.now().strftime("%Y-%m-%d_%H-%M")
 
 # ---- Settings -------------------------------------------------------------
 
 VEH_KG = 8000
 VEH_PALLETS = 15
-CAP_KM = 120.0            # max straight-line km between areas that can share a vehicle
+MAX_ROUTE_KM = 400.0      # ceiling: max closed-loop km for one vehicle (depot -> stops -> depot)
+ROUTE_PCT = 0.9           # per depot, the cap is this percentile of that depot's real route km (never above MAX_ROUTE_KM)
+ROUTE_CAP = {}            # depot -> cap km; filled in main() from the actual routes
+FLEET_CAP = {             # vehicles available per depot per day (names as in the matrix)
+    "Doncaster": 6,
+    "Warrington": 8,
+    "Watford": 18,
+    "Bristol Outbase": 3,
+}                         # depots not listed here are not capped (Solihull is not given yet)
+ROUTE_DETAIL = True       # writes a "Route detail" sheet: every stop, leg and cumulative km (After plan)
+
+C_OUTPUT_PATH = (os.getenv("C_OUTPUT_PATH") or "").strip().strip('"').strip("'") or None   # raw orders CSV: default for the orders prompt
+PROMPT_SECONDS = 3        # the consolidated file is used if nothing is typed within this time
 
 # Raw file column positions (0-based): I, J, K, Y, AG, AN
 DATE_COL, KG_COL, PAL_COL, TEAM_COL, ROUTE_COL, AREA_COL = 8, 9, 10, 24, 32, 39
@@ -48,22 +71,27 @@ def ask_path(prompt):
     # Strip the quotes Windows adds when you copy a path
     return Path(input(prompt).strip().strip('"').strip("'"))
 
-def choose_anneal_run():
-    runs = [d for d in ANNEAL_FOLDER.iterdir() if d.is_dir() and d.name.startswith("Run_")]
-    if any(ANNEAL_FOLDER.glob("Anneal_*_Regional_*.xlsx")):
-        runs.append(ANNEAL_FOLDER)         # single-depot runs save straight into this folder
+def choose_run(folder, title):
+    """Pick one of the five most recent runs in folder (Run_ subfolders or files saved directly)."""
+    runs = [d for d in folder.iterdir() if d.is_dir() and d.name.startswith("Run_")]
+    if any(folder.glob("Anneal_*_Regional_*.xlsx")):
+        runs.append(folder)                # single-depot runs save straight into this folder
     if not runs:
-        raise SystemExit(f"No anneal runs found in {ANNEAL_FOLDER}")
+        raise SystemExit(f"No {title} runs found in {folder}")
     runs = sorted(runs, key=lambda d: d.stat().st_mtime, reverse=True)[:5]
-    print("\nMost recent anneal runs:")
+    print(f"\nMost recent {title} runs:")
     for i, d in enumerate(runs, start=1):
         saved = datetime.fromtimestamp(d.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-        label = d.name if d != ANNEAL_FOLDER else "(single-depot files in this folder)"
+        label = d.name if d != folder else f"(single-depot files in this folder)"
         print(f"  {i}. {label}  (saved {saved})")
     choice = input("Enter the number to use: ").strip()
     if not choice.isdigit() or not 1 <= int(choice) <= len(runs):
         raise SystemExit("Not a valid choice")
     return runs[int(choice) - 1]
+
+
+def choose_anneal_run():
+    return choose_run(ANNEAL_FOLDER, "anneal")
 
 # ---- Loading --------------------------------------------------------------
 def num(s):
@@ -95,10 +123,95 @@ def load_orders(path):
     return o.reset_index(drop=True)
 
 
-def load_plan(folder):
-    """depot -> (area -> new days, set of pallet-network areas)."""
+def timed_input(prompt, seconds, default):
+    """Typed line, or default if nothing is typed within `seconds`.
+
+    The timer stops once typing starts, so a half-typed answer is not cut short.
+    Windows console (msvcrt); on other systems, select() on stdin.
+    """
+    print(prompt, end="", flush=True)
+    try:
+        import msvcrt
+    except ImportError:
+        import select
+        import sys
+        ready, _, _ = select.select([sys.stdin], [], [], seconds)
+        if ready:
+            return sys.stdin.readline().strip()
+        print()
+        return default
+
+    import time
+    buf, deadline = [], time.time() + seconds
+    while True:
+        if msvcrt.kbhit():
+            ch = msvcrt.getwch()
+            if ch in ("\r", "\n"):
+                print()
+                return "".join(buf).strip()
+            if ch == "\b":
+                if buf:
+                    buf.pop()
+                    print("\b \b", end="", flush=True)
+            else:
+                buf.append(ch)
+                print(ch, end="", flush=True)
+        elif not buf and time.time() >= deadline:
+            print()
+            return default
+        else:
+            time.sleep(0.05)
+
+
+def choose_plan_source():
+    """The plan to use: an anneal run. A consolidated plan file is not yet defined."""
+    return choose_anneal_run()
+
+
+def choose_planning_source():
+    """Planning step only: anneal or sweep output. Waits for a valid answer (no default)."""
+    if SWEEP_FOLDER is None:
+        raise SystemExit("S_OUTPUT_DIR is not set in .env, so sweep runs cannot be chosen")
+    while True:
+        choice = input("Plan source: 1 = Anneal, 2 = Sweep: ").strip()
+        if choice == "1":
+            return choose_run(ANNEAL_FOLDER, "anneal")
+        if choice == "2":
+            return choose_run(SWEEP_FOLDER, "sweep")
+        print("Please type 1 or 2")
+
+
+def check_csv(path):
+    """Stop with a clear message if the orders path is not a file."""
+    p = Path(path)
+    if not p.is_file():
+        kind = "a folder" if p.is_dir() else "not found"
+        raise SystemExit(f"Raw csv {kind}: {p}\n"
+                         "Check C_OUTPUT_PATH in .env points to the orders CSV file itself.")
+    return p
+
+
+def choose_orders_path():
+    """Raw orders CSV. C_OUTPUT_PATH is used after the timer unless another path is typed."""
+    if not C_OUTPUT_PATH:
+        return check_csv(ask_path("Please enter path to raw csv file: "))
+    print(f"\nRaw csv file: {C_OUTPUT_PATH}")
+    answer = timed_input(f"Press Enter to use it, or type another path "
+                         f"(used after {PROMPT_SECONDS} seconds): ", PROMPT_SECONDS, "")
+    if answer == "":
+        return check_csv(C_OUTPUT_PATH)
+    return check_csv(answer.strip().strip('"').strip("'"))
+
+
+def load_plan(source):
+    """depot -> (area -> new days, set of pallet-network areas).
+
+    source is a folder of Anneal_*_Regional_*.xlsx files, or one such file.
+    """
+    source = Path(source)
+    files = [source] if source.is_file() else sorted(source.glob("Anneal_*_Regional_*.xlsx"))
     plans = {}
-    for f in sorted(Path(folder).glob("Anneal_*_Regional_*.xlsx")):
+    for f in files:
         depot = str(pd.read_excel(f, sheet_name="Summary").loc[0, "Depot"]).strip()
         dist = pd.read_excel(f, sheet_name="Districts", dtype=str).fillna("")
         outl = pd.read_excel(f, sheet_name="Outliers", dtype=str).fillna("")
@@ -113,13 +226,6 @@ def load_plan(folder):
         print(f"Plan: {depot} ({f.name}) - {len(new)} areas with days, "
               f"{len(pallet_areas)} pallet-network areas")
     return plans
-
-
-def area_coords():
-    m = load_matrix(select_matrix_path())
-    m = m[(m[EAST] > 0) & (m[NORTH] > 0)]
-    c = m.groupby(AREA)[[EAST, NORTH]].mean() / 1000          # km
-    return {a: (x, y) for a, x, y in zip(c.index, c[EAST], c[NORTH])}
 
 
 def pick_weeks(o):
@@ -151,80 +257,123 @@ def pick_weeks(o):
 
 
 # ---- Packing --------------------------------------------------------------
-def letters(area):
-    m = re.match(r"[A-Z]+", area)
-    return m.group(0) if m else area
+# A vehicle is {"kg": float, "pal": float, "items": [(area, kg, pal), ...]}.
+# Items are whole orders, so an order is never split between vehicles.
+
+def areas_of(v):
+    """area -> kg for one vehicle."""
+    out = {}
+    for area, kg, _ in v["items"]:
+        out[area] = out.get(area, 0.0) + kg
+    return out
 
 
-def vehicle_distance(a, b, coords):
-    best = np.inf
-    for x in a["areas"]:
-        for y in b["areas"]:
-            if x in coords and y in coords:
-                d = np.hypot(coords[x][0] - coords[y][0], coords[x][1] - coords[y][1])
-                best = min(best, d)
-    return best
+def fits(v, kg, pal):
+    return v["kg"] + kg <= VEH_KG and v["pal"] + pal <= VEH_PALLETS
 
 
-def pack(orders, coords):
-    """orders: rows with area, kg, pal for one depot and day. Returns vehicles."""
+def add_item(v, item):
+    _, kg, pal = item
+    v["items"].append(item)
+    v["kg"] += kg
+    v["pal"] += pal
+
+
+def copy_vehicle(v):
+    return {"kg": v["kg"], "pal": v["pal"], "items": list(v["items"])}
+
+
+def route_km_fn(coords, depot_xy):
+    """Returns route_km(areas): closed-loop km for a set of areas, cached."""
+    cache = {}
+
+    def route_km(areas):
+        key = frozenset(areas)
+        if key not in cache:
+            cache[key] = vehicle_route(sorted(key), coords, depot_xy)[1] if key else 0.0
+        return cache[key]
+
+    return route_km
+
+
+def pack(orders, coords, depot_xy, cap):
+    """orders: rows with area, kg, pal for one depot and day. cap: max route km. Returns vehicles."""
+    route_km = route_km_fn(coords, depot_xy)
     vehicles = []
 
-    def fits(v, kg, pal):
-        return v["kg"] + kg <= VEH_KG and v["pal"] + pal <= VEH_PALLETS
-
-    # Stage 1: pack within each postcode area only
+    # Stage 1: first fit, largest orders first, within each postcode area.
+    # An order joins a vehicle only if its route stays within cap.
     area_order = orders.groupby("area")["kg"].sum().sort_values(ascending=False).index
     for area in area_order:
         own = []
         items = orders[orders["area"] == area].sort_values("kg", ascending=False)
         for kg, pal in zip(items["kg"], items["pal"]):
-            v = next((v for v in own if fits(v, kg, pal)), None)
+            v = next((v for v in own if fits(v, kg, pal)
+                      and route_km(set(areas_of(v)) | {area}) <= cap), None)
             if v is None:
-                v = {"kg": 0.0, "pal": 0.0, "areas": {}}
+                v = {"kg": 0.0, "pal": 0.0, "items": []}
                 own.append(v)
-            v["kg"] += kg
-            v["pal"] += pal
-            v["areas"][area] = v["areas"].get(area, 0.0) + kg
+            add_item(v, (area, kg, pal))
         vehicles.extend(own)
 
-    # Stage 2: merge vehicles with nearby areas on the same day, same letter first
-    for same_letter in (True, False):
-        while True:
-            pair = None
-            for a in sorted(vehicles, key=lambda v: v["kg"]):
-                best = None
-                for b in vehicles:
-                    if b is a or not fits(b, a["kg"], a["pal"]):
-                        continue
-                    if same_letter and not ({letters(x) for x in a["areas"]}
-                                            & {letters(y) for y in b["areas"]}):
-                        continue
-                    d = vehicle_distance(a, b, coords)
-                    if d <= CAP_KM and (best is None or d < best[0]):
-                        best = (d, b)
-                if best:
-                    pair = (a, best[1])
+    # Stage 2: empty the smallest vehicles where every order can be placed elsewhere
+    return consolidate(vehicles, coords, route_km, cap)
+
+
+def consolidate(vehicles, coords, route_km, cap):
+    """Remove vehicles by moving their orders into the other vehicles on the day.
+
+    Smallest vehicles are tried first, and their orders largest first. Each order
+    goes to the vehicle where the closed route adds the fewest km, provided the
+    load fits and the route stays within cap. A vehicle is removed only
+    if every one of its orders is placed. Repeats until no vehicle can be emptied.
+    """
+    changed = True
+    while changed:
+        changed = False
+        for src in sorted(vehicles, key=lambda v: v["kg"]):
+            trial = [copy_vehicle(v) for v in vehicles if v is not src]
+            placed_all = True
+            for item in sorted(src["items"], key=lambda it: -it[1]):
+                area, kg, pal = item
+                if area not in coords:         # no grid reference: distance unknown, never moved
+                    placed_all = False
                     break
-            if pair is None:
+                best = None
+                for dst in trial:
+                    if not fits(dst, kg, pal):
+                        continue
+                    current = set(areas_of(dst))
+                    new_km = route_km(current | {area})
+                    if new_km > cap:
+                        continue
+                    add = new_km - route_km(current)
+                    if best is None or add < best[0]:
+                        best = (add, dst)
+                if best is None:
+                    placed_all = False
+                    break
+                add_item(best[1], item)
+            if placed_all:
+                vehicles = trial
+                changed = True
                 break
-            a, b = pair
-            b["kg"] += a["kg"]
-            b["pal"] += a["pal"]
-            for k, val in a["areas"].items():
-                b["areas"][k] = b["areas"].get(k, 0.0) + val
-            vehicles[:] = [v for v in vehicles if v is not a]
     return vehicles
 
 
-def vehicle_rows(week, depot, day, plan, vehicles):
+def vehicle_rows(week, depot, day, plan, vehicles, coords, depot_xy):
     rows = []
     for i, v in enumerate(sorted(vehicles, key=lambda v: -v["kg"]), start=1):
+        areas = areas_of(v)
+        order, km, stop_km, unlocated = vehicle_route(areas, coords, depot_xy)
         rows.append({"Week": week, "Depot": depot, "Day": day, "Plan": plan,
-                     "Vehicle": i, "Areas": ", ".join(sorted(v["areas"])),
+                     "Vehicle": i, "Order": order, "Areas": ", ".join(sorted(areas)),
                      "KG": round(v["kg"]), "Pallets": round(v["pal"], 1),
                      "KG fill %": round(v["kg"] / VEH_KG, 2),
-                     "Pallet fill %": round(v["pal"] / VEH_PALLETS, 2)})
+                     "Pallet fill %": round(v["pal"] / VEH_PALLETS, 2),
+                     "Route km": round(km, 1),
+                     "Stop km": round(stop_km, 1),
+                     "Areas without grid ref": len(unlocated)})
     return rows
 
 
@@ -239,7 +388,7 @@ def target_day(row, plan_new, pallet_areas, cache):
     return cache[key]
 
 
-def simulate(label, wk, wo, plans, coords):
+def simulate(label, wk, wo, plans, coords, depot_xy):
     out = {"Daily": [], "Vehicles": [], "Moves": [], "Pallet_areas": [], "Checks": []}
     weekday = wo[wo["day"].isin(DAYS)]
     out["Checks"].append({"Week": label, "Week ID": wk,
@@ -250,7 +399,11 @@ def simulate(label, wk, wo, plans, coords):
         if depot not in plans:
             print(f"{label} {depot}: no anneal plan, skipped")
             continue
+        if depot not in depot_xy:
+            raise SystemExit(f"No depot position for '{depot}'. Check the Depot names in the matrix "
+                             f"match DEPOT_CODES: {sorted(depot_xy)}")
         new, pallet_areas = plans[depot]
+        cap = ROUTE_CAP.get(depot, MAX_ROUTE_KM)
         o = weekday[weekday["depot"] == depot].copy()
         if o.empty:
             continue
@@ -266,8 +419,8 @@ def simulate(label, wk, wo, plans, coords):
         for day in DAYS:
             before = o[o["day"] == day]
             after = o[o["new_day"] == day]
-            veh_b = pack(before, coords)
-            veh_a = pack(after, coords)
+            veh_b = pack(before, coords, depot_xy[depot], cap)
+            veh_a = pack(after, coords, depot_xy[depot], cap)
             moved_out = before.loc[(before["new_day"] != day) & (before["new_day"] != PALLET), "kg"].sum()
             moved_in = after.loc[after["day"] != day, "kg"].sum()
             moved_out_total += moved_out
@@ -286,8 +439,8 @@ def simulate(label, wk, wo, plans, coords):
                 "KG after": round(after["kg"].sum()),
                 "Pallets after": round(after["pal"].sum(), 1),
             })
-            out["Vehicles"] += vehicle_rows(label, depot, day, "Before", veh_b)
-            out["Vehicles"] += vehicle_rows(label, depot, day, "After", veh_a)
+            out["Vehicles"] += vehicle_rows(label, depot, day, "Before", veh_b, coords, depot_xy[depot])
+            out["Vehicles"] += vehicle_rows(label, depot, day, "After", veh_a, coords, depot_xy[depot])
 
         mv = (o[(o["new_day"] != o["day"]) & (o["new_day"] != PALLET)]
               .groupby(["area", "day", "new_day"])
@@ -311,6 +464,19 @@ def simulate(label, wk, wo, plans, coords):
                               "Moved difference": round(moved_out_total - moved_in_total, 1)})
     return out
 
+
+def route_detail_rows(label, res, coords, depot_xy):
+    """Every point of every After route, with leg and cumulative km."""
+    rows = []
+    for v in res["Vehicles"]:
+        if v["Plan"] != "After" or not v["Order"]:
+            continue
+        for leg in route_legs(v["Order"], coords, depot_xy[v["Depot"]]):
+            rows.append({"Week": label, "Depot": v["Depot"], "Day": v["Day"],
+                         "Vehicle": v["Vehicle"], **leg})
+    return rows
+
+
 def route_rows(label, res):
     daily = pd.DataFrame(res["Daily"])
     if daily.empty:
@@ -325,11 +491,14 @@ def route_rows(label, res):
                 g = after[(after["Depot"] == depot) & (after["Day"] == day)].sort_values("Vehicle")
                 for _, r in g.iterrows():
                     rows.append({"Week": label, "Depot": depot, "Day": day, "Route": int(r["Vehicle"]),
-                                 "Weight": int(r["KG"]), "Pallets": r["Pallets"]})
+                                 "Weight": int(r["KG"]), "Pallets": r["Pallets"],
+                                 "Route km": r["Route km"], "Stop km": r["Stop km"],
+                                 "Areas without grid ref": int(r["Areas without grid ref"])})
             pn = pallets[(pallets["Depot"] == depot) & (pallets["Day"] == day)] if not pallets.empty else pallets
             rows.append({"Week": label, "Depot": depot, "Day": day, "Route": "Pallet Network",
                          "Weight": int(pn["KG"].sum()) if not pn.empty else 0,
-                         "Pallets": round(pn["Pallets"].sum(), 1) if not pn.empty else 0})
+                         "Pallets": round(pn["Pallets"].sum(), 1) if not pn.empty else 0,
+                         "Route km": None, "Stop km": None, "Areas without grid ref": None})
     return rows
 
 
@@ -348,27 +517,157 @@ def summary_rows(label, res):
         for depot, row in counts.iterrows():
             rows.append({"Week": label, "Basis": basis, "Depot": depot,
                          **{d: int(row[d]) for d in DAYS}, "Total": int(row.sum())})
+    if not after.empty:
+        km = sum_route_km(after, ["Depot", "Day"]).pivot(index="Depot", columns="Day", values="Route km")
+        km = km.reindex(index=actual.index, columns=DAYS).fillna(0.0)
+        for depot, row in km.iterrows():
+            rows.append({"Week": label, "Basis": "Planned route km", "Depot": depot,
+                         **{d: round(float(row[d]), 1) for d in DAYS},
+                         "Total": round(float(row.sum()), 1)})
+        over = planned.reindex(index=actual.index, columns=DAYS).fillna(0)
+        for depot, row in over.iterrows():
+            cap = FLEET_CAP.get(depot)
+            if cap is None:
+                continue
+            excess = {d: max(0, int(row[d]) - cap) for d in DAYS}
+            rows.append({"Week": label, "Basis": "Vehicles over fleet cap", "Depot": depot,
+                         **excess, "Total": sum(excess.values())})
     return rows
+
+def actual_route_rows(orders, coords, depot_xy):
+    """Each real route (depot, day, route ID) measured as one closed straight-line loop."""
+    rows = []
+    o = orders[orders["day"].isin(DAYS)]
+    for (depot, day, route), g in o.groupby(["depot", "day", "route"]):
+        if depot not in depot_xy:
+            continue
+        areas = sorted(set(g["area"]))
+        _, km, _, unlocated = vehicle_route(areas, coords, depot_xy[depot])
+        rows.append({"Depot": depot, "Day": day, "Route": route,
+                     "Areas": ", ".join(areas), "KG": round(g["kg"].sum()),
+                     "Route km": round(km, 1), "Areas without grid ref": len(unlocated)})
+    return rows
+
+
+def route_caps(rows):
+    """Per depot: ROUTE_PCT percentile of real route km, never above MAX_ROUTE_KM."""
+    df = pd.DataFrame(rows)
+    caps = {}
+    if df.empty:
+        return caps
+    for depot, g in df.groupby("Depot"):
+        caps[depot] = min(round(float(g["Route km"].quantile(ROUTE_PCT)), 1), MAX_ROUTE_KM)
+    return caps
+
+
+def route_km_summary(rows):
+    """Median, 90th percentile and longest real route per depot."""
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return []
+    out = []
+    for depot, g in df.groupby("Depot"):
+        k = g["Route km"]
+        out.append({"Depot": depot, "Routes": len(k), "Median km": round(k.median(), 1),
+                    "90th percentile km": round(k.quantile(0.9), 1), "Longest km": round(k.max(), 1)})
+    return out
+
+def pick_example_routes(vehicles, n_random=2, seed=1):
+    """Per depot: the longest planned route across all simulated weeks, then n_random others (seeded)."""
+    picks = []
+    if not vehicles:
+        return picks
+    rng = random.Random(seed)
+    by_depot = {}
+    for v in vehicles:
+        by_depot.setdefault(v["Depot"], []).append(v)
+    for depot in sorted(by_depot):
+        recs = by_depot[depot]
+        longest = max(recs, key=lambda v: v["Route km"])
+        others = [v for v in recs if v is not longest]
+        picks.append(("Longest", longest))
+        picks += [("Random", s) for s in rng.sample(others, min(n_random, len(others)))]
+    return picks
+
+
+def draw_route_map(kind, v, coords, depot_xy, outline, out_png):
+    """Straight-line map of one planned route: depot, stops in visiting order, back to depot."""
+    depot, order, km = v["Depot"], v["Order"], v["Route km"]
+    if not order:
+        print(f"No located areas on {depot} {v['Day']} vehicle {v['Vehicle']}, map skipped")
+        return None
+
+    # coords are km; the outline is in metres (EPSG 27700), so convert here
+    xy = [(depot_xy[depot][0] * 1000, depot_xy[depot][1] * 1000) if node == DEPOT_KEY
+          else (coords[node][0] * 1000, coords[node][1] * 1000) for node in order]
+    xs, ys = [p[0] for p in xy], [p[1] for p in xy]
+    stops = [p for node, p in zip(order, xy) if node != DEPOT_KEY]
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    if outline is not None:
+        outline.plot(ax=ax, color="#dedede", edgecolor="white", linewidth=0.3)
+    ax.plot(xs, ys, color="#1f5fa8", linewidth=1.2, zorder=2)
+    if stops:
+        ax.scatter([p[0] for p in stops], [p[1] for p in stops], s=18,
+                   color="#1f5fa8", linewidths=0, zorder=3)
+    ax.scatter([xy[0][0]], [xy[0][1]], marker="*", s=220, color="#c00000", zorder=4)
+
+    span = max(max(xs) - min(xs), max(ys) - min(ys))
+    pad = max(span * 0.1, 5000)
+    ax.set_xlim(min(xs) - pad, max(xs) + pad)
+    ax.set_ylim(min(ys) - pad, max(ys) + pad)
+    ax.set_aspect("equal")
+    ax.set_axis_off()
+    n_areas = len(v["Areas"].split(", ")) if v["Areas"] else 0
+    ax.set_title(f"{depot} {v['Day']} vehicle {v['Vehicle']} ({kind.lower()}, week {v['Week']})\n"
+                 f"{km:.0f} km loop, {n_areas} areas, {v['KG']:,.0f} kg",
+                 fontsize=11, fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=MAP_DPI)
+    plt.close(fig)
+    return out_png
+
 
 # ---- Main -----------------------------------------------------------------
 def main():
-    orders = load_orders(ask_path("Please enter path to raw csv file: "))
-    plans = load_plan(choose_anneal_run())
-    coords = area_coords()
+    orders = load_orders(choose_orders_path())
+    plans = load_plan(choose_planning_source())
+    coords, depot_xy = load_grid_refs()
+    print("Depot positions (km): " + ", ".join(f"{d} ({x:.1f}, {y:.1f})" for d, (x, y) in depot_xy.items()))
     missing = sorted(set(orders["area"]) - set(coords))
     if missing:
-        print(f"Areas with no grid reference (never merged across): {missing}")
+        print(f"Areas with no grid reference (never merged across, no route km): {missing}")
 
     picks = pick_weeks(orders)
     band_of = {wk: band for band, wk in picks}
-    tables = {"Band averages": [], "Pivot": [], "Weeks": [], "Summary": [], "Routes": [], "Moves": [], "Checks": []}
+    tables = {"Band averages": [], "Pivot": [], "Weeks": [], "Summary": [], "Daily": [],
+              "Routes": [], "Moves": [], "Checks": []}
+    if ROUTE_DETAIL:
+        tables["Route detail"] = []
+    actual = actual_route_rows(orders, coords, depot_xy)
+    tables["Actual route km"] = actual
+    tables["Actual route summary"] = route_km_summary(actual)
+    ROUTE_CAP.update(route_caps(actual))
+    for row in tables["Actual route summary"]:
+        row["Cap km used"] = ROUTE_CAP.get(row["Depot"], MAX_ROUTE_KM)
+    print("Route cap km per depot: " + (", ".join(f"{d} {c:.1f}" for d, c in ROUTE_CAP.items())
+                                       or "none, using MAX_ROUTE_KM"))
+    planned_vehicles = []
     for band, wk in picks:
         wo = orders[orders["wk"] == wk]
         tables["Weeks"].append({"Band": band, "Week ID": wk,
                                 "KG": round(wo["kg"].sum()), "Routes": wo["route"].nunique()})
-        res = simulate(wk, wk, wo, plans, coords)
+        res = simulate(wk, wk, wo, plans, coords, depot_xy)
+        planned_vehicles += [v for v in res["Vehicles"] if v["Plan"] == "After" and v["Order"]]
+        veh = pd.DataFrame(res["Vehicles"])
+        km = {} if veh.empty else sum_route_km(veh, ["Plan"]).set_index("Plan")["Route km"].to_dict()
+        tables["Weeks"][-1]["Route km before"] = round(km.get("Before", 0.0), 1)
+        tables["Weeks"][-1]["Route km after"] = round(km.get("After", 0.0), 1)
         tables["Routes"] += route_rows(wk, res)
+        if ROUTE_DETAIL:
+            tables["Route detail"] += route_detail_rows(wk, res, coords, depot_xy)
         tables["Summary"] += summary_rows(wk, res)
+        tables["Daily"] += res["Daily"]
         tables["Moves"] += res["Moves"]
         tables["Checks"] += res["Checks"]
 
@@ -382,8 +681,20 @@ def main():
     pivot = pivot.reindex(columns=DAYS)
     tables["Pivot"] = pivot.reset_index().to_dict("records")
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out = OUTPUT_DIR / f"Example_weeks_{RUN_STAMP}.xlsx"
+    run_dir = OUTPUT_DIR / f"Run_{RUN_STAMP}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    example_routes = pick_example_routes(planned_vehicles)
+    if example_routes:
+        outline = load_uk_outline()
+        for kind, v in example_routes:
+            name = f"{v['Depot']}_{v['Day']}_week_{v['Week']}_vehicle_{v['Vehicle']}_{kind}.png"
+            png = draw_route_map(kind, v, coords, depot_xy, outline,
+                                 run_dir / name.replace(" ", "_").replace("/", "_"))
+            if png:
+                print(f"Saved {png}")
+
+    out = run_dir / f"Example_weeks_{RUN_STAMP}.xlsx"
     with pd.ExcelWriter(out) as xl:
         for name, rows in tables.items():
             pd.DataFrame(rows).to_excel(xl, sheet_name=name, index=False)

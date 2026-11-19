@@ -1,10 +1,12 @@
 """Shared loader, day rules and neighbour checks used by both balancing approaches."""
 import itertools
+import os
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from sklearn.neighbors import NearestNeighbors
+from dotenv import load_dotenv
 
 # ---- Shared settings ------------------------------------------------------
 
@@ -16,15 +18,22 @@ DEPOT = "Depot"
 EAST = "GRIDE_Ave"
 NORTH = "GRIDN_Ave"
 
-MAX_DAYS = 3              # maximum number of days in a pattern
+MAX_DAYS = 2              # maximum number of days in a pattern
 NEIGHBOURS = 4            # a district is "next to" its 4 nearest districts
 
+# ---- environment variables ------------------------------------------------------
+
+load_dotenv()
+BUILT_MATRIX_PATH = Path(os.environ["MATRIX_OUT"])  # built matrix (build_matrix output)
+CURRENT_MATRIX_PATH = Path(os.environ["MATRIX_CURRENT"])  # existing matrix (Matrix V1)
+
 # ---- Matrix sources -------------------------------------------------------
+
+
+
 MATRIX_OPTIONS = {
-    "1": ("Built matrix (build_matrix output)",
-          Path(r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\project_swichback\Python_project\Data\Matrix_output\MatrixV2.csv")),
-    "2": ("Existing matrix (Matrix V1)",
-          Path(r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\project_swichback\Matix files\Matrix V1.csv")),
+    "1": ("Built matrix (build_matrix output)", BUILT_MATRIX_PATH),
+    "2": ("Existing matrix (Matrix V1)", CURRENT_MATRIX_PATH),
 }
 
 

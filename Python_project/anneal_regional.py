@@ -9,8 +9,9 @@ from the same active districts.
 """
 import math
 import os
-from datetime import datetime
+from datetime import datetime   
 from pathlib import Path
+from dotenv import load_dotenv
 
 import numpy as np
 import pandas as pd
@@ -19,11 +20,13 @@ from sklearn.cluster import KMeans
 from matrix_common import (AREA, DAYS, DEPOT, EAST, NORTH,
                            PATTERNS, district_new_loads, load_matrix,
                            select_matrix_path, zone_loads,closed_tour_km)
+from maps_common import add_maps_sheet, load_uk_outline, plot_depot_maps
 
 
 # ---- Settings -------------------------------------------------------------
-DEPOT_NAME = None          # a depot name, or None = every depot
-OUTPUT_DIR = Path(r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\project_swichback\Matix files\Output")
+DEPOT_NAME = "Watford"          # a depot name, or None = every depot
+load_dotenv()
+OUTPUT_DIR = Path(os.environ["A_OUTPUT_DIR"])
 RUN_STAMP = datetime.now().strftime("%Y-%m-%d_%H-%M")   # set when the script starts
 
 # Remote letters: weighted centre further than REMOTE_KM from the depot's main
@@ -56,6 +59,8 @@ T_START = 10.0             # km: early moves may worsen the cost by about this m
 T_END = 0.05               # km: late moves must almost always improve
 SEED = 0
 AUTO_OPEN = True           # opens the workbook only when a single depot is run
+
+MAKE_MAPS = True           # day maps come from maps_common.py (shared with the sweep)
 
 # ---- Route length cap -----------------------------------------------------
 # Baseline = 95th percentile of planned route lengths per depot (route_baseline.py)
@@ -455,6 +460,12 @@ def write_outputs(depot_df, active, zero, excluded, outliers, groups,
         daily_df.to_excel(xl, sheet_name="Daily loads", index=False)
         outliers.to_excel(xl, sheet_name="Outliers", index=False)
     print(f"Saved {out}")
+
+    if MAKE_MAPS:
+        png = run_dir / f"Maps_{depot_name.replace(' ', '_')}_{RUN_STAMP}.png"
+        plot_depot_maps(depot_name, map_rows, depot_df, png, load_uk_outline())
+        add_maps_sheet(out, png)
+        print(f"Saved map {png}")
     return out
 
 
@@ -548,13 +559,11 @@ def main():
     depots = sorted(df[DEPOT].unique()) if DEPOT_NAME is None else [DEPOT_NAME]
     print(f"Depots to run: {', '.join(depots)}")
 
-    # One dated folder per multi-depot run; a single depot saves to the output folder
-    if len(depots) > 1:
-        run_dir = OUTPUT_DIR / f"Run_{RUN_STAMP}"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        print(f"Saving this run to: {run_dir}")
-    else:
-        run_dir = OUTPUT_DIR
+    # One dated folder per run
+    run_dir = OUTPUT_DIR / f"Run_{RUN_STAMP}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Saving this run to: {run_dir}")
+    
 
     outputs = []
     for depot in depots:
@@ -563,11 +572,11 @@ def main():
             outputs.append(out)
 
     print(f"\nFinished: {len(outputs)} of {len(depots)} depots saved to {run_dir}")
-    if AUTO_OPEN and len(outputs) == 1:
+    if AUTO_OPEN and outputs:
         try:
-            os.startfile(outputs[0])
+            os.startfile(run_dir)      # open the run folder so all files are visible
         except OSError as e:
-            print(f"Could not open {outputs[0]}: {e}")
+            print(f"Could not open {run_dir}: {e}")
     elif AUTO_OPEN and len(outputs) > 1:
         try:
             os.startfile(run_dir)      # open the folder so all files are visible
