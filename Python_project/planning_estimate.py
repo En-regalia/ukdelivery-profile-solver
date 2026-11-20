@@ -1,17 +1,45 @@
-"""Example-week simulation: actual routes vs the solver's new day plan.
+"""Example-week simulation: actual routes vs the solver's new day plan, van and truck fleet.
 
 For the lowest, median and peak network weeks (by kg):
 - Before: actual routes (unique assignedRouteUID) per depot per day, plus a
   vehicle estimate from kg and pallets.
 - After: each order moves to its area's new day (same rule as map_days).
   Outliers and external letters go to "Pallet network" with no vehicles.
-- Vehicles: packed per depot per day at 8000 kg / 15 pallets.
-  Stage 1 packs within each postcode area (first fit, largest orders first).
-  Stage 2 empties the smallest vehicles by moving their orders into other
-  vehicles on the same day, where the load fits, the closed route stays within
-  MAX_ROUTE_KM, and the added route km is smallest.
-  Each depot's vehicle count is checked against FLEET_CAP.
-Both plans use the same packing, so the comparison is like for like.
+- Vehicles, packed per depot per day, within the depot's fleet:
+    Van: 1000 kg / 5 pallets, route ceiling 500 km (hard).
+    HGV (8t): 8000 kg / 15 pallets. Routes are built at this size first.
+    26t: 12000 kg / 20 pallets. A route is upgraded from HGV to 26t only when that
+    lets it absorb another route's orders (so one truck fewer), and the 26t fleet
+    has room. Orders over 8t go straight onto 26t routes.
+    Both truck types use the depot's real-route cap (90th percentile of actual HGV routes).
+  Route km is straight-line (depot -> stops -> depot), so it understates road
+  distance. The ceilings apply to these straight-line km.
+  FLEET_CAP is enforced: no depot-day uses more vans, 8t HGVs or 26ts than its fleet.
+  Any order that cannot be placed within a route ceiling or the fleet goes to the
+  pallet network (the "Overflow" sheet), with its reason: "route cap", "fleet", or
+  "too big" (over 26t limits; counted with the route cap orders).
+
+  Van selection maximises the number of orders on the vans. Van-eligible orders
+  (fit a van on their own) are taken smallest first, by kg then pallets. Each goes
+  into the van it fills most tightly, provided the van's route stays within 500 km.
+  Orders no van can take go to the trucks.
+
+  Truck steps:
+  1. Pack the orders onto 8t routes by postcode area (first fit, largest orders first),
+     within the route cap. Orders over 8t go to 26t routes instead.
+  2. Consolidate: empty a route into the others. A route that can't take an order at 8t
+     is upgraded to 26t if the 26t fleet has room. Repeat until no route can be emptied.
+  3. Fleet: if there are still more 26t or 8t routes than the fleet allows, the routes
+     carrying the most orders are kept and the rest of their orders are placed into them
+     where they fit within the cap. Whatever cannot be placed is the fleet overflow.
+  A new truck is only opened for an order whose own closed loop is within the cap.
+Both plans use the same packing and the same fleet limits, so the comparison
+is like for like.
+
+Actual routes are typed as vans when the whole route fits a van (under 1000 kg
+and 5 pallets, as on the vehicle-type rule), otherwise as HGV routes (26t routes
+are not split out of the actual data). The truck route cap comes from the 90th
+percentile of actual HGV routes per depot, and is used for both 8t and 26t.
 
 Route km (added): each packed vehicle's straight-line closed loop, depot -> stops
 -> depot, from routing.py (nearest neighbour then 2-opt). Route km includes both
@@ -43,18 +71,25 @@ RUN_STAMP = datetime.now().strftime("%Y-%m-%d_%H-%M")
 
 # ---- Settings -------------------------------------------------------------
 
-VEH_KG = 8000
-VEH_PALLETS = 15
-MAX_ROUTE_KM = 400.0      # ceiling: max closed-loop km for one vehicle (depot -> stops -> depot)
-ROUTE_PCT = 0.9           # per depot, the cap is this percentile of that depot's real route km (never above MAX_ROUTE_KM)
-ROUTE_CAP = {}            # depot -> cap km; filled in main() from the actual routes
-FLEET_CAP = {             # vehicles available per depot per day (names as in the matrix)
-    "Doncaster": 6,
-    "Warrington": 8,
-    "Watford": 18,
-    "Bristol Outbase": 3,
-}                         # depots not listed here are not capped (Solihull is not given yet)
+VEHICLE_TYPES = {
+    "HGV": {"kg": 8000, "pallets": 15, "max_km": 400.0},    # 8t truck; route ceiling = the depot's truck cap (see caps_for)
+    "26t": {"kg": 12000, "pallets": 20, "max_km": 400.0},   # 26t truck (an 8t route upgraded); cap = depot truck cap
+    "Van": {"kg": 1000, "pallets": 5, "max_km": 500.0},     # hard route ceiling, straight-line km
+}
+ROUTE_PCT = 0.9           # truck cap: this percentile of the depot's actual HGV route km (never above the HGV max_km)
+ROUTE_CAP = {}            # depot -> {"HGV": km}; filled in main() from the actual routes (26t uses the same cap)
+FLEET_CAP = {             # vehicles available per depot per day, by type (depot table, Porcelanosa)
+    "Doncaster": {"HGV": 4, "Van": 0, "26t": 0},
+    "Warrington": {"HGV": 6, "Van": 1, "26t": 0},
+    "Watford": {"HGV": 14, "Van": 4, "26t": 2},
+    "Bristol Outbase": {"HGV": 2, "Van": 1, "26t": 0},
+    "Solihull": {"HGV": 0, "Van": 0, "26t": 0},          # depot table shows no vehicles: every Solihull order overflows as "fleet"
+    "Hebburn": {"HGV": 3, "Van": 0, "26t": 0},           # no team code or grid reference in this script yet, so not used
+    "Aberdeen": {"HGV": 1, "Van": 0, "26t": 0},          # no team code or grid reference in this script yet, so not used
+    "Renfrew": {"HGV": 4, "Van": 0, "26t": 1},           # no team code or grid reference in this script yet, so not used
+}
 ROUTE_DETAIL = True       # writes a "Route detail" sheet: every stop, leg and cumulative km (After plan)
+EXAMPLE_MIN_DROPS = 4     # example maps only use routes with more than 3 drops (4 or more stops)
 
 C_OUTPUT_PATH = (os.getenv("C_OUTPUT_PATH") or "").strip().strip('"').strip("'") or None   # raw orders CSV: default for the orders prompt
 PROMPT_SECONDS = 3        # the consolidated file is used if nothing is typed within this time
@@ -256,9 +291,43 @@ def pick_weeks(o):
     return picks
 
 
-# ---- Packing --------------------------------------------------------------
-# A vehicle is {"kg": float, "pal": float, "items": [(area, kg, pal), ...]}.
+# ---- Vehicle types ----------------------------------------------------------
+# A vehicle is {"type": "HGV", "26t" or "Van", "kg": float, "pal": float, "items": [(area, kg, pal), ...]}.
 # Items are whole orders, so an order is never split between vehicles.
+# A truck starts as "HGV" (8t) and becomes "26t" only when an upgrade is needed (see take).
+
+def order_fits_type(kg, pal, vtype):
+    """True if one order fits an empty vehicle of this type."""
+    spec = VEHICLE_TYPES[vtype]
+    return kg <= spec["kg"] and pal <= spec["pallets"]
+
+
+def fits_type(orders, vtype):
+    """Boolean mask: which orders in a DataFrame fit an empty vehicle of this type."""
+    spec = VEHICLE_TYPES[vtype]
+    return (orders["kg"] <= spec["kg"]) & (orders["pal"] <= spec["pallets"])
+
+
+def route_is_van(kg, pal):
+    """Actual routes: a route is a van route if the whole load fits a van."""
+    return order_fits_type(kg, pal, "Van")
+
+
+def caps_for(depot):
+    """Hard route km ceiling per vehicle type for one depot (HGV and 26t: depot truck cap; Van: 500 km)."""
+    caps = {vt: spec["max_km"] for vt, spec in VEHICLE_TYPES.items()}
+    caps.update(ROUTE_CAP.get(depot, {}))
+    caps["26t"] = caps["HGV"]
+    return caps
+
+
+def fleet_for(depot):
+    """Vehicles available per day per type for one depot. None = not capped."""
+    limits = FLEET_CAP.get(depot, {})
+    return {vt: limits.get(vt) for vt in VEHICLE_TYPES}
+
+
+# ---- Packing --------------------------------------------------------------
 
 def areas_of(v):
     """area -> kg for one vehicle."""
@@ -269,7 +338,9 @@ def areas_of(v):
 
 
 def fits(v, kg, pal):
-    return v["kg"] + kg <= VEH_KG and v["pal"] + pal <= VEH_PALLETS
+    """True if the order fits in the vehicle as it is now (its current type's size)."""
+    spec = VEHICLE_TYPES[v["type"]]
+    return v["kg"] + kg <= spec["kg"] and v["pal"] + pal <= spec["pallets"]
 
 
 def add_item(v, item):
@@ -280,7 +351,31 @@ def add_item(v, item):
 
 
 def copy_vehicle(v):
-    return {"kg": v["kg"], "pal": v["pal"], "items": list(v["items"])}
+    return {"type": v["type"], "kg": v["kg"], "pal": v["pal"], "items": list(v["items"])}
+
+
+def can_take(v, kg, pal, trucks, lim26):
+    """True if truck v can take the order as it is, or as a 26t upgrade of an 8t route.
+
+    An upgrade needs room in the 26t fleet: fewer 26t trucks in `trucks` than lim26
+    (None = no limit). trucks is the set of trucks in the plan being built.
+    """
+    if fits(v, kg, pal):
+        return True
+    if v["type"] != "HGV":
+        return False
+    if lim26 is not None and sum(1 for t in trucks if t["type"] == "26t") >= lim26:
+        return False
+    spec = VEHICLE_TYPES["26t"]
+    return v["kg"] + kg <= spec["kg"] and v["pal"] + pal <= spec["pallets"]
+
+
+def take(v, item):
+    """Add an order to a truck, upgrading an 8t route to 26t if its load now needs it."""
+    add_item(v, item)
+    h8 = VEHICLE_TYPES["HGV"]
+    if v["type"] == "HGV" and (v["kg"] > h8["kg"] or v["pal"] > h8["pallets"]):
+        v["type"] = "26t"
 
 
 def route_km_fn(coords, depot_xy):
@@ -296,13 +391,48 @@ def route_km_fn(coords, depot_xy):
     return route_km
 
 
-def pack(orders, coords, depot_xy, cap):
-    """orders: rows with area, kg, pal for one depot and day. cap: max route km. Returns vehicles."""
-    route_km = route_km_fn(coords, depot_xy)
-    vehicles = []
+def select_van_loads(eligible, n_vans, route_km, cap):
+    """Choose the van-eligible orders that go on vans: as many orders as possible.
 
-    # Stage 1: first fit, largest orders first, within each postcode area.
-    # An order joins a vehicle only if its route stays within cap.
+    Orders are taken smallest first (kg, then pallets). Each goes into the van, among
+    the n_vans vans of the day, that it fills most tightly, provided the van's closed
+    route stays within cap (500 km, hard). Vans are not grouped by area. An order no
+    van can take is returned unplaced, for the trucks.
+    n_vans None means no fleet limit.
+    Returns (van loads, unplaced index labels).
+    """
+    spec = VEHICLE_TYPES["Van"]
+    if n_vans is None:
+        n_vans = len(eligible)
+    loads = [{"type": "Van", "kg": 0.0, "pal": 0.0, "items": []} for _ in range(n_vans)]
+    unplaced = []
+    ordered = eligible.sort_values(["kg", "pal"], kind="stable")
+    for idx, area, kg, pal in zip(ordered.index, ordered["area"], ordered["kg"], ordered["pal"]):
+        best = None
+        for v in loads:
+            if not fits(v, kg, pal):
+                continue
+            if route_km(set(areas_of(v)) | {area}) > cap:
+                continue
+            left = spec["kg"] - (v["kg"] + kg)
+            if best is None or left < best[0]:
+                best = (left, v)
+        if best is None:
+            unplaced.append(idx)
+        else:
+            add_item(best[1], (area, kg, pal))
+    return [v for v in loads if v["items"]], unplaced
+
+
+def place(orders, route_km, cap, vtype="HGV"):
+    """Pack orders into vehicles of one size with no fleet limit, first fit within each postcode area.
+
+    vtype: the route size, "HGV" (8t) or "26t". cap: hard route km ceiling. A new route is
+    only opened for an order whose own closed loop is within cap, so a single far-away stop
+    cannot start a route over the ceiling. Orders must already fit an empty vehicle of vtype.
+    Returns (vehicles, orders blocked by the route cap as (area, kg, pal) tuples).
+    """
+    vehicles, cap_over = [], []
     area_order = orders.groupby("area")["kg"].sum().sort_values(ascending=False).index
     for area in area_order:
         own = []
@@ -311,27 +441,29 @@ def pack(orders, coords, depot_xy, cap):
             v = next((v for v in own if fits(v, kg, pal)
                       and route_km(set(areas_of(v)) | {area}) <= cap), None)
             if v is None:
-                v = {"kg": 0.0, "pal": 0.0, "items": []}
+                if route_km({area}) > cap:
+                    cap_over.append((area, kg, pal))
+                    continue
+                v = {"type": vtype, "kg": 0.0, "pal": 0.0, "items": []}
                 own.append(v)
             add_item(v, (area, kg, pal))
         vehicles.extend(own)
-
-    # Stage 2: empty the smallest vehicles where every order can be placed elsewhere
-    return consolidate(vehicles, coords, route_km, cap)
+    return vehicles, cap_over
 
 
-def consolidate(vehicles, coords, route_km, cap):
-    """Remove vehicles by moving their orders into the other vehicles on the day.
+def consolidate(vehicles, coords, route_km, caps):
+    """Remove vans by moving their orders into the other vans.
 
     Smallest vehicles are tried first, and their orders largest first. Each order
     goes to the vehicle where the closed route adds the fewest km, provided the
-    load fits and the route stays within cap. A vehicle is removed only
+    load fits and the route stays within the cap. A vehicle is removed only
     if every one of its orders is placed. Repeats until no vehicle can be emptied.
     """
     changed = True
     while changed:
         changed = False
         for src in sorted(vehicles, key=lambda v: v["kg"]):
+            cap = caps[src["type"]]
             trial = [copy_vehicle(v) for v in vehicles if v is not src]
             placed_all = True
             for item in sorted(src["items"], key=lambda it: -it[1]):
@@ -341,6 +473,8 @@ def consolidate(vehicles, coords, route_km, cap):
                     break
                 best = None
                 for dst in trial:
+                    if dst["type"] != src["type"]:
+                        continue
                     if not fits(dst, kg, pal):
                         continue
                     current = set(areas_of(dst))
@@ -361,17 +495,146 @@ def consolidate(vehicles, coords, route_km, cap):
     return vehicles
 
 
+def consolidate_trucks(trucks, coords, route_km, cap, lim26):
+    """Empty trucks into other trucks, so the fewest trucks are used.
+
+    Smallest trucks are emptied first, and their orders largest first. Each order goes
+    to the truck where the closed route adds the fewest km. A truck that can't take an
+    order at 8t is upgraded to 26t if the 26t fleet has room (see can_take). A truck is
+    removed only if every one of its orders is placed. Repeats until no truck can be emptied.
+    """
+    changed = True
+    while changed:
+        changed = False
+        for src in sorted(trucks, key=lambda v: v["kg"]):
+            trial = [copy_vehicle(v) for v in trucks if v is not src]
+            placed_all = True
+            for item in sorted(src["items"], key=lambda it: -it[1]):
+                area, kg, pal = item
+                if area not in coords:         # no grid reference: distance unknown, never moved
+                    placed_all = False
+                    break
+                best = None
+                for dst in trial:
+                    if not can_take(dst, kg, pal, trial, lim26):
+                        continue
+                    current = set(areas_of(dst))
+                    new_km = route_km(current | {area})
+                    if new_km > cap:
+                        continue
+                    add = new_km - route_km(current)
+                    if best is None or add < best[0]:
+                        best = (add, dst)
+                if best is None:
+                    placed_all = False
+                    break
+                take(best[1], item)
+            if placed_all:
+                trucks = trial
+                changed = True
+                break
+    return trucks
+
+
+def fit_fleet(trucks, fleet, route_km, cap):
+    """Trim trucks to the fleet. Returns (kept trucks, fleet overflow as (area, kg, pal) tuples).
+
+    26t trucks over the 26t fleet are dropped first, then 8t trucks over the 8t fleet.
+    A dropped truck's orders go into the kept trucks where they fit within the cap (an 8t
+    kept truck may be upgraded only if the 26t fleet has room). The truck with the fewest
+    orders is dropped first. Orders that still cannot be placed are the fleet overflow.
+    """
+    lim8, lim26 = fleet["HGV"], fleet["26t"]
+    kept = list(trucks)
+    overflow = []
+
+    def n_type(t):
+        return sum(1 for v in kept if v["type"] == t)
+
+    def drop_one(vtype):
+        cands = [v for v in kept if v["type"] == vtype]
+        dropped = min(cands, key=lambda v: (len(v["items"]), v["kg"]))
+        kept[:] = [v for v in kept if v is not dropped]
+        for item in sorted(dropped["items"], key=lambda it: (it[1], it[2])):
+            area, kg, pal = item
+            best = None
+            for dst in kept:
+                if not can_take(dst, kg, pal, kept, lim26):
+                    continue
+                current = set(areas_of(dst))
+                new_km = route_km(current | {area})
+                if new_km > cap:
+                    continue
+                add = new_km - route_km(current)
+                if best is None or add < best[0]:
+                    best = (add, dst)
+            if best is None:
+                overflow.append(item)
+            else:
+                take(best[1], item)
+
+    while lim26 is not None and n_type("26t") > lim26:
+        drop_one("26t")
+    while lim8 is not None and n_type("HGV") > lim8:
+        drop_one("HGV")
+    return kept, overflow
+
+
+def pack(orders, coords, depot_xy, caps, fleet):
+    """orders: rows with area, kg, pal for one depot and day.
+
+    caps: type -> hard route km ceiling (trucks: depot cap; Van: 500 km).
+    fleet: type -> most vehicles on the day (None = no limit).
+
+    1. Van-eligible orders: select as many as possible onto the van fleet, with each
+       van's route within 500 km.
+    2. Everything else is packed onto 8t routes by area within the cap. Orders over 8t
+       go onto 26t routes. Orders over 26t limits are "too big".
+    3. Consolidation empties trucks into others. A truck that cannot take an order at 8t
+       is upgraded to 26t if the 26t fleet has room (consolidate_trucks).
+    4. Trucks are trimmed to the fleet (fit_fleet). Orders that still do not fit are
+       fleet overflow.
+
+    Returns (vehicles, overflow DataFrame with Reason "route cap", "too big" or "fleet").
+    """
+    route_km = route_km_fn(coords, depot_xy)
+    spec = VEHICLE_TYPES["Van"]
+    eligible = (orders["kg"] <= spec["kg"]) & (orders["pal"] <= spec["pallets"])
+
+    van_loads, unplaced_van = select_van_loads(orders[eligible], fleet["Van"], route_km, caps["Van"])
+    rest = pd.concat([orders[~eligible], orders.loc[unplaced_van]])
+    fits_8 = fits_type(rest, "HGV")
+    fits_26 = fits_type(rest, "26t")
+    too_big = rest[~fits_26]
+    hgv, cap_over_8 = place(rest[fits_8], route_km, caps["HGV"], "HGV")
+    heavy, cap_over_26 = place(rest[~fits_8 & fits_26], route_km, caps["26t"], "26t")
+
+    trucks = consolidate_trucks(hgv + heavy, coords, route_km, caps["HGV"], fleet["26t"])
+    trucks, fleet_over = fit_fleet(trucks, fleet, route_km, caps["HGV"])
+    vans = consolidate(van_loads, coords, route_km, caps)
+
+    rows = ([("route cap", a, k, p) for a, k, p in cap_over_8 + cap_over_26]
+            + [("too big", a, k, p) for a, k, p in too_big[["area", "kg", "pal"]].itertuples(index=False, name=None)]
+            + [("fleet", a, k, p) for a, k, p in fleet_over])
+    overflow = pd.DataFrame(rows, columns=["Reason", "area", "kg", "pal"])
+    return vans + trucks, overflow
+
+
 def vehicle_rows(week, depot, day, plan, vehicles, coords, depot_xy):
     rows = []
-    for i, v in enumerate(sorted(vehicles, key=lambda v: -v["kg"]), start=1):
+    # trucks listed first (26t, then 8t), then vans, each by weight
+    for i, v in enumerate(sorted(vehicles, key=lambda v: (v["type"] == "Van", v["type"] != "26t", -v["kg"])), start=1):
         areas = areas_of(v)
         order, km, stop_km, unlocated = vehicle_route(areas, coords, depot_xy)
+        spec = VEHICLE_TYPES[v["type"]]
         rows.append({"Week": week, "Depot": depot, "Day": day, "Plan": plan,
-                     "Vehicle": i, "Order": order, "Areas": ", ".join(sorted(areas)),
+                     "Vehicle": i, "Type": v["type"], "Order": order, "Areas": ", ".join(sorted(areas)),
+                     "Drops": max(len(order) - 2, 0),
                      "KG": round(v["kg"]), "Pallets": round(v["pal"], 1),
-                     "KG fill %": round(v["kg"] / VEH_KG, 2),
-                     "Pallet fill %": round(v["pal"] / VEH_PALLETS, 2),
+                     "KG fill %": round(v["kg"] / spec["kg"], 2),
+                     "Pallet fill %": round(v["pal"] / spec["pallets"], 2),
                      "Route km": round(km, 1),
+                     "Over van 500 km": v["type"] == "Van" and km > VEHICLE_TYPES["Van"]["max_km"],
                      "Stop km": round(stop_km, 1),
                      "Areas without grid ref": len(unlocated)})
     return rows
@@ -388,8 +651,25 @@ def target_day(row, plan_new, pallet_areas, cache):
     return cache[key]
 
 
+def type_counts(vehicles):
+    """(vans, 8t HGVs, 26ts) in a list of vehicle dicts."""
+    vans = sum(1 for v in vehicles if v["type"] == "Van")
+    t26 = sum(1 for v in vehicles if v["type"] == "26t")
+    return vans, len(vehicles) - vans - t26, t26
+
+
+def overflow_counts(over):
+    """(route cap orders, route cap kg, fleet orders, fleet kg) in an overflow table.
+
+    "too big" orders (over the 26t limits) are counted in the route cap group.
+    """
+    r = over[over["Reason"].isin(["route cap", "too big"])]
+    f = over[over["Reason"] == "fleet"]
+    return len(r), round(r["kg"].sum()), len(f), round(f["kg"].sum())
+
+
 def simulate(label, wk, wo, plans, coords, depot_xy):
-    out = {"Daily": [], "Vehicles": [], "Moves": [], "Pallet_areas": [], "Checks": []}
+    out = {"Daily": [], "Vehicles": [], "Moves": [], "Pallet_areas": [], "Overflow": [], "Checks": []}
     weekday = wo[wo["day"].isin(DAYS)]
     out["Checks"].append({"Week": label, "Week ID": wk,
                           "Raw kg": round(wo["kg"].sum()),
@@ -403,7 +683,8 @@ def simulate(label, wk, wo, plans, coords, depot_xy):
             raise SystemExit(f"No depot position for '{depot}'. Check the Depot names in the matrix "
                              f"match DEPOT_CODES: {sorted(depot_xy)}")
         new, pallet_areas = plans[depot]
-        cap = ROUTE_CAP.get(depot, MAX_ROUTE_KM)
+        caps = caps_for(depot)
+        fleet = fleet_for(depot)
         o = weekday[weekday["depot"] == depot].copy()
         if o.empty:
             continue
@@ -419,28 +700,62 @@ def simulate(label, wk, wo, plans, coords, depot_xy):
         for day in DAYS:
             before = o[o["day"] == day]
             after = o[o["new_day"] == day]
-            veh_b = pack(before, coords, depot_xy[depot], cap)
-            veh_a = pack(after, coords, depot_xy[depot], cap)
+            veh_b, over_b = pack(before, coords, depot_xy[depot], caps, fleet)
+            veh_a, over_a = pack(after, coords, depot_xy[depot], caps, fleet)
             moved_out = before.loc[(before["new_day"] != day) & (before["new_day"] != PALLET), "kg"].sum()
             moved_in = after.loc[after["day"] != day, "kg"].sum()
             moved_out_total += moved_out
             moved_in_total += moved_in
             pallet = before[before["new_day"] == PALLET]
+
+            rows_b = vehicle_rows(label, depot, day, "Before", veh_b, coords, depot_xy[depot])
+            rows_a = vehicle_rows(label, depot, day, "After", veh_a, coords, depot_xy[depot])
+            out["Vehicles"] += rows_b + rows_a
+
+            # Actual routes for the day, split by whether the whole route fits a van
+            rt = before.groupby("route")[["kg", "pal"]].sum()
+            van_routes = int(sum(route_is_van(k, p) for k, p in zip(rt["kg"], rt["pal"])))
+            vans_b, hgvs_b, t26_b = type_counts(veh_b)
+            vans_a, hgvs_a, t26_a = type_counts(veh_a)
+            rc_b_n, rc_b_kg, fl_b_n, fl_b_kg = overflow_counts(over_b)
+            rc_a_n, rc_a_kg, fl_a_n, fl_a_kg = overflow_counts(over_a)
+
             out["Daily"].append({
                 "Week": label, "Depot": depot, "Day": day,
                 "Routes before": before["route"].nunique(),
+                "Van routes before": van_routes,
+                "HGV routes before": before["route"].nunique() - van_routes,
                 "Vehicles before": len(veh_b),
+                "Vans before": vans_b,
+                "HGVs before": hgvs_b,
+                "26t before": t26_b,
+                "Vans over 500 km before": sum(1 for r in rows_b if r["Over van 500 km"]),
+                "Over route cap before orders": rc_b_n,
+                "Over route cap before KG": rc_b_kg,
+                "Over fleet before orders": fl_b_n,
+                "Over fleet before KG": fl_b_kg,
                 "KG before": round(before["kg"].sum()),
                 "Pallets before": round(before["pal"].sum(), 1),
                 "Pallet network KG": round(pallet["kg"].sum()),
                 "Moved out KG": round(moved_out),
                 "Moved in KG": round(moved_in),
                 "Vehicles after": len(veh_a),
+                "Vans after": vans_a,
+                "HGVs after": hgvs_a,
+                "26t after": t26_a,
+                "Vans over 500 km after": sum(1 for r in rows_a if r["Over van 500 km"]),
+                "Over route cap after orders": rc_a_n,
+                "Over route cap after KG": rc_a_kg,
+                "Over fleet after orders": fl_a_n,
+                "Over fleet after KG": fl_a_kg,
                 "KG after": round(after["kg"].sum()),
                 "Pallets after": round(after["pal"].sum(), 1),
             })
-            out["Vehicles"] += vehicle_rows(label, depot, day, "Before", veh_b, coords, depot_xy[depot])
-            out["Vehicles"] += vehicle_rows(label, depot, day, "After", veh_a, coords, depot_xy[depot])
+
+            for _, r in over_a.iterrows():
+                out["Overflow"].append({"Week": label, "Depot": depot, "Day": day, "Area": r["area"],
+                                        "Reason": r["Reason"], "KG": round(r["kg"]),
+                                        "Pallets": round(r["pal"], 1)})
 
         mv = (o[(o["new_day"] != o["day"]) & (o["new_day"] != PALLET)]
               .groupby(["area", "day", "new_day"])
@@ -473,7 +788,7 @@ def route_detail_rows(label, res, coords, depot_xy):
             continue
         for leg in route_legs(v["Order"], coords, depot_xy[v["Depot"]]):
             rows.append({"Week": label, "Depot": v["Depot"], "Day": v["Day"],
-                         "Vehicle": v["Vehicle"], **leg})
+                         "Vehicle": v["Vehicle"], "Type": v["Type"], **leg})
     return rows
 
 
@@ -491,14 +806,17 @@ def route_rows(label, res):
                 g = after[(after["Depot"] == depot) & (after["Day"] == day)].sort_values("Vehicle")
                 for _, r in g.iterrows():
                     rows.append({"Week": label, "Depot": depot, "Day": day, "Route": int(r["Vehicle"]),
-                                 "Weight": int(r["KG"]), "Pallets": r["Pallets"],
+                                 "Type": r["Type"], "Weight": int(r["KG"]), "Pallets": r["Pallets"],
+                                 "Drops": int(r["Drops"]),
                                  "Route km": r["Route km"], "Stop km": r["Stop km"],
+                                 "Over van 500 km": bool(r["Over van 500 km"]),
                                  "Areas without grid ref": int(r["Areas without grid ref"])})
             pn = pallets[(pallets["Depot"] == depot) & (pallets["Day"] == day)] if not pallets.empty else pallets
             rows.append({"Week": label, "Depot": depot, "Day": day, "Route": "Pallet Network",
-                         "Weight": int(pn["KG"].sum()) if not pn.empty else 0,
+                         "Type": "", "Weight": int(pn["KG"].sum()) if not pn.empty else 0,
                          "Pallets": round(pn["Pallets"].sum(), 1) if not pn.empty else 0,
-                         "Route km": None, "Stop km": None, "Areas without grid ref": None})
+                         "Drops": None, "Route km": None, "Stop km": None,
+                         "Over van 500 km": None, "Areas without grid ref": None})
     return rows
 
 
@@ -509,14 +827,38 @@ def summary_rows(label, res):
     vehicles = pd.DataFrame(res["Vehicles"])
     after = vehicles[vehicles["Plan"] == "After"] if not vehicles.empty else vehicles
     rows = []
-    actual = daily.pivot_table(index="Depot", columns="Day", values="Routes before", aggfunc="sum")
-    planned = (after.groupby(["Depot", "Day"]).size().unstack() if not after.empty
-               else pd.DataFrame(index=actual.index))
-    for basis, counts in [("Actual routes", actual), ("Planned vehicles", planned)]:
-        counts = counts.reindex(columns=DAYS).fillna(0).astype(int)
+
+    def daily_pivot(col):
+        return daily.pivot_table(index="Depot", columns="Day", values=col, aggfunc="sum")
+
+    actual = daily_pivot("Routes before")
+
+    def planned(vtype=None):
+        if after.empty:
+            return pd.DataFrame(index=actual.index)
+        sub = after if vtype is None else after[after["Type"] == vtype]
+        if sub.empty:
+            return pd.DataFrame(index=actual.index)
+        return sub.groupby(["Depot", "Day"]).size().unstack()
+
+    bases = [("Actual routes", actual),
+             ("Actual van routes", daily_pivot("Van routes before")),
+             ("Actual HGV routes", daily_pivot("HGV routes before")),
+             ("Planned vehicles", planned()),
+             ("Planned vans", planned("Van")),
+             ("Planned HGVs", planned("HGV")),
+             ("Planned 26t", planned("26t")),
+             ("Vans over 500 km (after, check)", daily_pivot("Vans over 500 km after")),
+             ("Orders over route cap (after)", daily_pivot("Over route cap after orders")),
+             ("Orders over fleet (after)", daily_pivot("Over fleet after orders")),
+             ("Orders over route cap (before)", daily_pivot("Over route cap before orders")),
+             ("Orders over fleet (before)", daily_pivot("Over fleet before orders"))]
+    for basis, counts in bases:
+        counts = counts.reindex(index=actual.index, columns=DAYS).fillna(0).astype(int)
         for depot, row in counts.iterrows():
             rows.append({"Week": label, "Basis": basis, "Depot": depot,
                          **{d: int(row[d]) for d in DAYS}, "Total": int(row.sum())})
+
     if not after.empty:
         km = sum_route_km(after, ["Depot", "Day"]).pivot(index="Depot", columns="Day", values="Route km")
         km = km.reindex(index=actual.index, columns=DAYS).fillna(0.0)
@@ -524,15 +866,19 @@ def summary_rows(label, res):
             rows.append({"Week": label, "Basis": "Planned route km", "Depot": depot,
                          **{d: round(float(row[d]), 1) for d in DAYS},
                          "Total": round(float(row.sum()), 1)})
-        over = planned.reindex(index=actual.index, columns=DAYS).fillna(0)
+
+    # Check only: packing stops at the fleet and the route ceilings, so these should always be zero
+    for vtype, name in [("Van", "Vans over fleet cap"), ("HGV", "HGVs over fleet cap"), ("26t", "26t over fleet cap")]:
+        over = planned(vtype).reindex(index=actual.index, columns=DAYS).fillna(0)
         for depot, row in over.iterrows():
-            cap = FLEET_CAP.get(depot)
+            cap = FLEET_CAP.get(depot, {}).get(vtype)
             if cap is None:
                 continue
             excess = {d: max(0, int(row[d]) - cap) for d in DAYS}
-            rows.append({"Week": label, "Basis": "Vehicles over fleet cap", "Depot": depot,
+            rows.append({"Week": label, "Basis": name, "Depot": depot,
                          **excess, "Total": sum(excess.values())})
     return rows
+
 
 def actual_route_rows(orders, coords, depot_xy):
     """Each real route (depot, day, route ID) measured as one closed straight-line loop."""
@@ -543,48 +889,72 @@ def actual_route_rows(orders, coords, depot_xy):
             continue
         areas = sorted(set(g["area"]))
         _, km, _, unlocated = vehicle_route(areas, coords, depot_xy[depot])
+        kg, pal = g["kg"].sum(), g["pal"].sum()
         rows.append({"Depot": depot, "Day": day, "Route": route,
-                     "Areas": ", ".join(areas), "KG": round(g["kg"].sum()),
+                     "Type": "Van" if route_is_van(kg, pal) else "HGV",
+                     "Areas": ", ".join(areas), "KG": round(kg),
                      "Route km": round(km, 1), "Areas without grid ref": len(unlocated)})
     return rows
 
 
 def route_caps(rows):
-    """Per depot: ROUTE_PCT percentile of real route km, never above MAX_ROUTE_KM."""
+    """Per depot: ROUTE_PCT percentile of actual HGV route km, never above the HGV max_km.
+
+    Van caps are not set here: vans use their fixed 500 km ceiling (see caps_for).
+    The 26t uses this same truck cap (see caps_for).
+    """
     df = pd.DataFrame(rows)
     caps = {}
     if df.empty:
         return caps
-    for depot, g in df.groupby("Depot"):
-        caps[depot] = min(round(float(g["Route km"].quantile(ROUTE_PCT)), 1), MAX_ROUTE_KM)
+    hgv = df[df["Type"] == "HGV"]
+    for depot, g in hgv.groupby("Depot"):
+        caps[depot] = {"HGV": min(round(float(g["Route km"].quantile(ROUTE_PCT)), 1),
+                                  VEHICLE_TYPES["HGV"]["max_km"])}
     return caps
 
 
 def route_km_summary(rows):
-    """Median, 90th percentile and longest real route per depot."""
+    """Median, 90th percentile and longest real route per depot and type."""
     df = pd.DataFrame(rows)
     if df.empty:
         return []
     out = []
-    for depot, g in df.groupby("Depot"):
+    for (depot, vtype), g in df.groupby(["Depot", "Type"]):
         k = g["Route km"]
-        out.append({"Depot": depot, "Routes": len(k), "Median km": round(k.median(), 1),
+        out.append({"Depot": depot, "Type": vtype, "Routes": len(k), "Median km": round(k.median(), 1),
                     "90th percentile km": round(k.quantile(0.9), 1), "Longest km": round(k.max(), 1)})
     return out
 
-def pick_example_routes(vehicles, n_random=2, seed=1):
-    """Per depot: the longest planned route across all simulated weeks, then n_random others (seeded)."""
+
+def drops(v):
+    """Stops on a planned route: the order list minus the depot at each end."""
+    return max(len(v["Order"]) - 2, 0)
+
+
+def pick_example_routes(vehicles, n_random=2, seed=1, min_drops=EXAMPLE_MIN_DROPS):
+    """Per depot and vehicle type: the longest planned route, then n_random others (seeded).
+
+    Vans, 8t HGVs and 26ts are sampled separately, so one type cannot crowd out the others.
+    Only routes with more than 3 drops (min_drops = 4) are considered, so the examples
+    show multi-stop routes rather than single long runs. A depot and type with no
+    such route falls back to all its routes.
+    """
     picks = []
     if not vehicles:
         return picks
     rng = random.Random(seed)
-    by_depot = {}
+    by_group = {}
     for v in vehicles:
-        by_depot.setdefault(v["Depot"], []).append(v)
-    for depot in sorted(by_depot):
-        recs = by_depot[depot]
-        longest = max(recs, key=lambda v: v["Route km"])
-        others = [v for v in recs if v is not longest]
+        by_group.setdefault((v["Depot"], v["Type"]), []).append(v)
+    for depot, vtype in sorted(by_group):
+        recs = by_group[(depot, vtype)]
+        multi = [v for v in recs if drops(v) >= min_drops]
+        if not multi:
+            print(f"{depot} {vtype}: no planned route with more than 3 drops, using all {vtype} routes for examples")
+            multi = recs
+        longest = max(multi, key=lambda v: v["Route km"])
+        others = [v for v in multi if v is not longest]
         picks.append(("Longest", longest))
         picks += [("Random", s) for s in rng.sample(others, min(n_random, len(others)))]
     return picks
@@ -594,7 +964,7 @@ def draw_route_map(kind, v, coords, depot_xy, outline, out_png):
     """Straight-line map of one planned route: depot, stops in visiting order, back to depot."""
     depot, order, km = v["Depot"], v["Order"], v["Route km"]
     if not order:
-        print(f"No located areas on {depot} {v['Day']} vehicle {v['Vehicle']}, map skipped")
+        print(f"No located areas on {depot} {v['Day']} {v['Type']} vehicle {v['Vehicle']}, map skipped")
         return None
 
     # coords are km; the outline is in metres (EPSG 27700), so convert here
@@ -619,8 +989,8 @@ def draw_route_map(kind, v, coords, depot_xy, outline, out_png):
     ax.set_aspect("equal")
     ax.set_axis_off()
     n_areas = len(v["Areas"].split(", ")) if v["Areas"] else 0
-    ax.set_title(f"{depot} {v['Day']} vehicle {v['Vehicle']} ({kind.lower()}, week {v['Week']})\n"
-                 f"{km:.0f} km loop, {n_areas} areas, {v['KG']:,.0f} kg",
+    ax.set_title(f"{depot} {v['Day']} {v['Type']} vehicle {v['Vehicle']} ({kind.lower()}, week {v['Week']})\n"
+                 f"{km:.0f} km loop, {drops(v)} drops, {v['KG']:,.0f} kg",
                  fontsize=11, fontweight="bold")
     fig.tight_layout()
     fig.savefig(out_png, dpi=MAP_DPI)
@@ -641,7 +1011,7 @@ def main():
     picks = pick_weeks(orders)
     band_of = {wk: band for band, wk in picks}
     tables = {"Band averages": [], "Pivot": [], "Weeks": [], "Summary": [], "Daily": [],
-              "Routes": [], "Moves": [], "Checks": []}
+              "Routes": [], "Moves": [], "Overflow": [], "Checks": []}
     if ROUTE_DETAIL:
         tables["Route detail"] = []
     actual = actual_route_rows(orders, coords, depot_xy)
@@ -649,9 +1019,9 @@ def main():
     tables["Actual route summary"] = route_km_summary(actual)
     ROUTE_CAP.update(route_caps(actual))
     for row in tables["Actual route summary"]:
-        row["Cap km used"] = ROUTE_CAP.get(row["Depot"], MAX_ROUTE_KM)
-    print("Route cap km per depot: " + (", ".join(f"{d} {c:.1f}" for d, c in ROUTE_CAP.items())
-                                       or "none, using MAX_ROUTE_KM"))
+        row["Cap km used"] = caps_for(row["Depot"])[row["Type"]]
+    cap_text = ", ".join(f"{d} HGV {c['HGV']:.1f} km" for d, c in ROUTE_CAP.items()) or "none, using HGV max_km"
+    print(f"Route caps: {cap_text}; 26t uses the same truck cap; vans {VEHICLE_TYPES['Van']['max_km']:.0f} km (hard)")
     planned_vehicles = []
     for band, wk in picks:
         wo = orders[orders["wk"] == wk]
@@ -669,6 +1039,7 @@ def main():
         tables["Summary"] += summary_rows(wk, res)
         tables["Daily"] += res["Daily"]
         tables["Moves"] += res["Moves"]
+        tables["Overflow"] += res["Overflow"]
         tables["Checks"] += res["Checks"]
 
     summary = pd.DataFrame(tables["Summary"])
@@ -688,7 +1059,7 @@ def main():
     if example_routes:
         outline = load_uk_outline()
         for kind, v in example_routes:
-            name = f"{v['Depot']}_{v['Day']}_week_{v['Week']}_vehicle_{v['Vehicle']}_{kind}.png"
+            name = (f"{v['Depot']}_{v['Day']}_week_{v['Week']}_{v['Type']}_vehicle_{v['Vehicle']}_{kind}.png")
             png = draw_route_map(kind, v, coords, depot_xy, outline,
                                  run_dir / name.replace(" ", "_").replace("/", "_"))
             if png:
