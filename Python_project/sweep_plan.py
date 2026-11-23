@@ -59,6 +59,10 @@ KM_W = 0.001              # per km of proxy, summed over weeks
 
 MAKE_MAPS = True          # day maps come from maps_common.py (shared with the anneal)
 
+HGV = PE.VEHICLE_TYPES["HGV"]   # 18t truck: the sweep's vehicle proxy
+# The proxy treats every vehicle as an 8t truck, so the cap is HGV + 26t fleet (vans left out)
+TRUCK_CAP = {d: fl.get("HGV", 0) + fl.get("26t", 0) for d, fl in PE.FLEET_CAP.items()}
+
 def _day_map(pattern):
     """5 x 5 matrix: old day (row) -> new day (column) under map_days for this pattern."""
     m = np.zeros((5, 5))
@@ -101,7 +105,7 @@ def build_depot(depot, plan_new, orders, weeks, coords, depot_pt):
 
     return {"areas": areas, "K": K, "P": P, "pat": np.array(pat), "dist": dist, "nb": nb,
             "active": K.sum(axis=(0, 2)) > 0, "kg_total": K.sum(axis=(0, 2)),
-            "cap": PE.FLEET_CAP.get(depot, float("inf")), "weeks": len(weeks),
+            "cap": TRUCK_CAP.get(depot, float("inf")), "weeks": len(weeks),
             "allowed": allowed,
             "DAY_MAP": np.stack([_day_map(p) for p in allowed]),
             "N_DAYS": np.array([len(p) for p in allowed])}
@@ -112,7 +116,7 @@ def evaluate(pat, D):
     MM = D["DAY_MAP"][pat]
     kg = np.einsum("wao,aod->wd", D["K"], MM)
     pal = np.einsum("wao,aod->wd", D["P"], MM)
-    veh = np.maximum(np.ceil(kg / PE.VEH_KG), np.ceil(pal / PE.VEH_PALLETS))
+    veh = np.maximum(np.ceil(kg / HGV["kg"]), np.ceil(pal / HGV["pallets"]))
     spread_v = veh.max(axis=1) - veh.min(axis=1)
     over = np.maximum(0, veh - D["cap"]).sum()
     avg = kg.mean(axis=1)
@@ -156,7 +160,7 @@ def week_metrics(label, res, plan_name):
     for depot, g in daily.groupby("Depot"):
         vehs = g.set_index("Day")["Vehicles after"].reindex(DAYS).fillna(0).astype(int)
         kgs = g.set_index("Day")["KG after"].reindex(DAYS).fillna(0)
-        cap = PE.FLEET_CAP.get(depot)
+        cap = TRUCK_CAP.get(depot)
         km = 0.0
         if not veh.empty:
             km = veh[(veh["Depot"] == depot) & (veh["Plan"] == "After")]["Route km"].sum()
