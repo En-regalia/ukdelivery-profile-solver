@@ -13,7 +13,7 @@ load_dotenv()
 
 DEPOT_PATH = Path(os.environ["DEPOT_PATH"])
 DEPOT_INFO_PATH = Path(os.environ["DEPOT_INFO_PATH"])
-DEPOT_OUT = Path(os.environ["DEPOT_OUT"])
+DEPOT_OUT = Path(os.environ["DEPOT_ASSIGNED"])
 
 AREA = "Postcode Area"
 DEPOT = "Depot"
@@ -119,7 +119,9 @@ def main():
               .to_string(index=False))
     print(f"\nBeyond {MAX_KM} km: {(result['Review'] != '').sum()}")
 
+    DEPOT_OUT.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(DEPOT_OUT, index=False, encoding="utf-8-sig")
+
     print(f"Saved: {DEPOT_OUT}")
 
 
