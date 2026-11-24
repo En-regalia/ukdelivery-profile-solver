@@ -24,7 +24,7 @@ from maps_common import add_maps_sheet, load_uk_outline, plot_depot_maps
 
 
 # ---- Settings -------------------------------------------------------------
-DEPOT_NAME = "Watford"          # a depot name, or None = every depot
+DEPOT_NAME = None          # a depot name, or None = every depot
 load_dotenv()
 OUTPUT_DIR = Path(os.environ["A_OUTPUT_DIR"])
 RUN_STAMP = datetime.now().strftime("%Y-%m-%d_%H-%M")   # set when the script starts
@@ -34,19 +34,19 @@ RUN_STAMP = datetime.now().strftime("%Y-%m-%d_%H-%M")   # set when the script st
 REMOTE_KM = 150.0
 MIN_DISTRICTS = 2
 
-GROUP_SIZE = 3             # about this many letter zones per group
+GROUP_SIZE = 2             # about this many letter zones per group
 PEAK_TOLERANCE = 0.03      # peak may rise this far above the Letters baseline peak
 PEAK_PENALTY = 500.0       # km added per 100% of peak excess above the limit
 PEAK_COST_KM = 1000.0      # km of day radius a 100% peak reduction is worth (0 = ignore)
 
 SPREAD_TOLERANCE = 0.05    # busiest minus quietest day, as a share of the average day
-SPREAD_PENALTY = 500.0     # km added per 100% of spread excess above the tolerance
+SPREAD_PENALTY = 1000.0     # km added per 100% of spread excess above the tolerance
 
 SPACING_DAYS_KM = 5.0      # km per unit of uneven spacing between a group's delivery days (0 = ignore)
 SPACING_IDEAL_GAP = 2      # ideal gap in days between consecutive deliveries (every other day)
 
 DAY_LOSS_KM = 10.0         # km cost per day short of a full week, averaged over kg
-MAX_DAY_COUNT = max(len(p) for p in PATTERNS)   # 3 with the current rules
+MAX_DAY_COUNT = max(len(p) for p in PATTERNS)   # 2 with the current rules set in Planning
 
 ISOLATION_KM = None        # e.g. 10 excludes districts averaging over 10 km to neighbours
 PERCENTILE = 98            # used when ISOLATION_KM is None

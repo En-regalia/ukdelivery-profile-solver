@@ -83,7 +83,7 @@ FLEET_CAP = {             # vehicles available per depot per day, by type (depot
     "Warrington": {"HGV": 6, "Van": 1, "26t": 0},
     "Watford": {"HGV": 14, "Van": 4, "26t": 2},
     "Bristol Outbase": {"HGV": 2, "Van": 1, "26t": 0},
-    "Solihull": {"HGV": 0, "Van": 0, "26t": 0},          # depot table shows no vehicles: every Solihull order overflows as "fleet"
+    "Solihull": {"HGV": 3, "Van": 1, "26t": 1},          # depot table shows no vehicles: every Solihull order overflows as "fleet"
     "Hebburn": {"HGV": 3, "Van": 0, "26t": 0},           # no team code or grid reference in this script yet, so not used
     "Aberdeen": {"HGV": 1, "Van": 0, "26t": 0},          # no team code or grid reference in this script yet, so not used
     "Renfrew": {"HGV": 4, "Van": 0, "26t": 1},           # no team code or grid reference in this script yet, so not used
@@ -100,6 +100,8 @@ DEPOT_CODES = {"1001601": "Watford", "1001599": "Solihull",
                "1001598": "Bristol Outbase", "1001593": "Doncaster",
                "1001597": "Warrington"}
 PALLET = "Pallet network";
+
+AUTO = False  # True = unattended: use the most recent run without asking
 
 # ---- Choose Anneal File run --------------------------------------------------------------
 def ask_path(prompt):
@@ -119,6 +121,10 @@ def choose_run(folder, title):
         saved = datetime.fromtimestamp(d.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
         label = d.name if d != folder else f"(single-depot files in this folder)"
         print(f"  {i}. {label}  (saved {saved})")
+    if AUTO:
+        chosen = runs[0]                   # newest run, already sorted first
+        print(f"Using most recent {title} run: {chosen.name if chosen != folder else folder.name}")
+        return chosen
     choice = input("Enter the number to use: ").strip()
     if not choice.isdigit() or not 1 <= int(choice) <= len(runs):
         raise SystemExit("Not a valid choice")

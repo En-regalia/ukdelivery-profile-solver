@@ -22,6 +22,11 @@ EAST, NORTH = "GRIDE_Ave", "GRIDN_Ave"
 PREFERRED_BONUS_KM = 15     # current depot treated as this many km closer
 MAX_KM = 150                 # flag areas further than this from their chosen depot
 
+# ---- Depot settings --------------------------------------------------------------
+
+# Leave empty to use every depot in the depot info file
+ACTIVE_DEPOTS = ["Watford", "Doncaster", "Bristol Outbase", "Warrington"]
+
 locked = {"Bristol Outbase"}  # areas that are locked to their current depot
 
 

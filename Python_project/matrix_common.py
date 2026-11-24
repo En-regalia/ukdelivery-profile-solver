@@ -8,6 +8,9 @@ import pandas as pd
 from sklearn.neighbors import NearestNeighbors
 from dotenv import load_dotenv
 
+import sys
+import time
+
 # ---- Shared settings ------------------------------------------------------
 
 SHEET_NAME = 0            # used only if the matrix is an Excel file
@@ -197,3 +200,31 @@ def closed_tour_km(pts, starts=20):
         if best is None or length < best[0]:
             best = (length, order)
     return loop_km(two_opt(best[1], d), d)
+
+
+def ask_skip(seconds=5, key="s"):
+    """True if the key is pressed within `seconds`; False if the time runs out."""
+    print(f"Press S to skip step 1 (depot assignment). "
+          f"It runs in {seconds} seconds if nothing is pressed.", flush=True)
+    try:
+        import msvcrt                      # Windows
+    except ImportError:
+        msvcrt = None
+
+    if msvcrt:
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if msvcrt.kbhit() and msvcrt.getwch().lower() == key:
+                print()
+                return True
+            time.sleep(0.05)
+        print()
+        return False
+
+    # Other systems: S must be followed by Enter
+    import select
+    ready, _, _ = select.select([sys.stdin], [], [], seconds)
+    if ready and sys.stdin.readline().strip().lower() == key:
+        return True
+    print()
+    return False

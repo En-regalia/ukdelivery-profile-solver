@@ -1,5 +1,6 @@
 """Current delivery matrix, grouped geographically into letter groups.
 Each group's pattern is the days it currently receives. No optimisation."""
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -8,11 +9,14 @@ from sklearn.cluster import KMeans
 
 from matrix_common import MATRIX_PATH, AREA, DAYS, DEPOT, EAST, NORTH, load_matrix
 
+from dotenv import load_dotenv
+load_dotenv() 
+
 # ---- Settings -------------------------------------------------------------
 DEPOT_NAME = "Watford"     # a depot name, or None = every depot
 GROUP_SIZE = 3.5           # about this many letters per group (63 letters -> 18 groups)
 MIN_DAY_SHARE = 0.05       # a day is in a group's pattern if it carries at least this share of its kg
-OUTPUT_DIR = Path(r"C:\Users\micranne\OneDrive - DPDHL\Documents\Porcelanosa\project_swichback\Matix files\Output")
+OUTPUT_DIR = Path(os.environ.get("CG_OUTPUT_DIR"))
 RUN_STAMP = datetime.now().strftime("%Y-%m-%d_%H-%M")
 
 
