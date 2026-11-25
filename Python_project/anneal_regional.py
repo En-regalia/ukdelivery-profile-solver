@@ -46,7 +46,7 @@ SPACING_DAYS_KM = 5.0      # km per unit of uneven spacing between a group's del
 SPACING_IDEAL_GAP = 2      # ideal gap in days between consecutive deliveries (every other day)
 
 DAY_LOSS_KM = 10.0         # km cost per day short of a full week, averaged over kg
-MAX_DAY_COUNT = max(len(p) for p in PATTERNS)   # 2 with the current rules set in Planning
+MAX_DAY_COUNT = max(len(p) for p in PATTERNS)   # 3 with the current rules set in Planning
 
 ISOLATION_KM = None        # e.g. 10 excludes districts averaging over 10 km to neighbours
 PERCENTILE = 98            # used when ISOLATION_KM is None

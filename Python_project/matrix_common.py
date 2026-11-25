@@ -21,7 +21,7 @@ DEPOT = "Depot"
 EAST = "GRIDE_Ave"
 NORTH = "GRIDN_Ave"
 
-MAX_DAYS = 2              # maximum number of days in a pattern
+MAX_DAYS = 3              # maximum number of days in a pattern
 NEIGHBOURS = 4            # a district is "next to" its 4 nearest districts
 
 # ---- environment variables ------------------------------------------------------
