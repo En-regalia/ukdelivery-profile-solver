@@ -89,7 +89,11 @@ FLEET_CAP = {             # vehicles available per depot per day, by type (depot
     "Renfrew": {"HGV": 4, "Van": 0, "26t": 1},           # no team code or grid reference in this script yet, so not used
 }
 ROUTE_DETAIL = True       # writes a "Route detail" sheet: every stop, leg and cumulative km (After plan)
-ACTUAL_COLOURS = ["#e07b00", "#7f7f7f", "#c0504d", "#9c6b30", "#b8860b", "#8e5a9b", "#4d4d4d", "#d9822b"]  # overlay; planned stays #1f5fa8
+PLANNED_COLOUR = "#1f5fa8"  # single planned route on the example maps
+ACTUAL_COLOUR = "#9a9a9a"   # actual routes, drawn behind the planned ones
+DAY_MAP_COLOURS = ["#1f5fa8", "#e07b00", "#2a9d3c", "#c0392b", "#8e5a9b", "#8c564b",
+                   "#d6458f", "#17a2b8", "#b8860b", "#2c3e50"]   # planned routes on the full-day maps
+DAY_MAPS = True           # one map per depot, day and week of that depot's example routes: all planned routes
 EXAMPLE_MIN_DROPS = 4     # example maps only use routes with more than 3 drops (4 or more stops)
 
 C_OUTPUT_PATH = (os.getenv("C_OUTPUT_PATH") or "").strip().strip('"').strip("'") or None   # raw orders CSV: default for the orders prompt
@@ -902,7 +906,7 @@ def actual_route_rows(orders, coords, depot_xy):
         kg, pal = g["kg"].sum(), g["pal"].sum()
         rows.append({"Week": wk, "Depot": depot, "Day": day, "Route": route,
                      "Type": "Van" if route_is_van(kg, pal) else "HGV",
-                     "Areas": ", ".join(areas), "KG": round(kg),
+                     "Areas": ", ".join(areas), "KG": round(kg), "Pallets": round(pal, 1),
                      "Route km": round(km, 1), "Areas without grid ref": len(unlocated)})
     return rows
 
@@ -976,78 +980,134 @@ def split_areas(text):
 
 
 def matching_actual_routes(v, actual):
-    """Actual routes that served any of a planned route's areas: same depot and week, any weekday.
+    """Actual routes on the same depot, day and week that served any of a planned route's areas.
 
-    Any day, because the After plan moves areas to new days: matching on the same day
-    would miss the areas that moved. These are the real loads, not the same vehicle.
+    These are the real loads, not the same vehicle. An area the plan moved to another
+    day has no actual route on the planned day, so it finds no match here.
     """
     areas = split_areas(v["Areas"])
     return [r for r in actual
-            if r["Depot"] == v["Depot"] and r["Week"] == v["Week"] and areas & split_areas(r["Areas"])]
+            if (r["Depot"], r["Day"], r["Week"]) == (v["Depot"], v["Day"], v["Week"])
+            and areas & split_areas(r["Areas"])]
+
+
+def fill_pct(kg, pal, vtypes):
+    """kg and pallet fill, as % of the combined capacity of the given vehicle types."""
+    cap_kg = sum(VEHICLE_TYPES[t]["kg"] for t in vtypes)
+    cap_pal = sum(VEHICLE_TYPES[t]["pallets"] for t in vtypes)
+    return (100 * kg / cap_kg if cap_kg else 0.0), (100 * pal / cap_pal if cap_pal else 0.0)
+
+
+def compare_footer(planned, actual):
+    """Footer lines: planned against actual route count, km, kg and fill."""
+    def line(label, rows):
+        kg, pal = sum(r["KG"] for r in rows), sum(r["Pallets"] for r in rows)
+        kg_f, pal_f = fill_pct(kg, pal, [r["Type"] for r in rows])
+        return (f"{label}: {len(rows)} route{'s' if len(rows) != 1 else ''}, "
+                f"{sum(r['Route km'] for r in rows):,.0f} km, {kg:,.0f} kg, "
+                f"fill {kg_f:.0f}% kg / {pal_f:.0f}% pallets")
+    return line("Planned", planned) + "\n" + line("Actual", actual)
+
+
+class MapFrame:
+    """One map figure: outline, depot star, loops in British National Grid metres."""
+
+    def __init__(self, depot, coords, depot_xy, outline):
+        self.depot, self.coords, self.depot_xy = depot, coords, depot_xy
+        self.fig, self.ax = plt.subplots(figsize=(7, 7.6))
+        if outline is not None:
+            outline.plot(ax=self.ax, color="#dedede", edgecolor="white", linewidth=0.3)
+        self.xs, self.ys = [], []
+
+    def to_xy(self, order):
+        # coords are km; the outline is in metres (EPSG 27700), so convert here
+        d = self.depot_xy[self.depot]
+        return [(d[0] * 1000, d[1] * 1000) if node == DEPOT_KEY
+                else (self.coords[node][0] * 1000, self.coords[node][1] * 1000) for node in order]
+
+    def loop(self, order, colour, lw, z, label=None, dashed=False, dot=14):
+        xy = self.to_xy(order)
+        xs, ys = [p[0] for p in xy], [p[1] for p in xy]
+        self.ax.plot(xs, ys, color=colour, linewidth=lw, linestyle="--" if dashed else "-",
+                     zorder=z, label=label)
+        self.ax.scatter(xs[1:-1], ys[1:-1], s=dot, color=colour, linewidths=0, zorder=z)
+        self.xs += xs
+        self.ys += ys
+        return xy
+
+    def actual(self, r, label=True):
+        """One actual route, grey and dashed, behind the planned routes (order from vehicle_route)."""
+        order = vehicle_route(sorted(split_areas(r["Areas"])), self.coords, self.depot_xy[self.depot])[0]
+        if not order:
+            return
+        xy = self.loop(order, ACTUAL_COLOUR, 0.9, 1, dashed=True, dot=8)
+        if label:
+            # label at the stop furthest from the depot
+            far = max(xy[1:-1], key=lambda p: (p[0] - xy[0][0]) ** 2 + (p[1] - xy[0][1]) ** 2)
+            self.ax.annotate(f"{r['Route']} {r['Route km']:.0f} km", far, xytext=(3, 3),
+                             textcoords="offset points", fontsize=6, color="#555555", zorder=5)
+
+    def save(self, title, footer, out_png, legend_cols=1):
+        ax = self.ax
+        d = self.to_xy([DEPOT_KEY])[0]
+        ax.scatter([d[0]], [d[1]], marker="*", s=220, color="#c00000", zorder=6)
+        xs, ys = self.xs or [d[0]], self.ys or [d[1]]
+        # square view centred on the routes, so wide or tall days still fill the figure
+        half = max(max(xs) - min(xs), max(ys) - min(ys)) * 0.6 + 5000
+        cx, cy = (max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2
+        ax.set_xlim(cx - half, cx + half)
+        ax.set_ylim(cy - half, cy + half)
+        ax.set_aspect("equal")
+        ax.set_axis_off()
+        ax.set_title(title, fontsize=11, fontweight="bold")
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(loc="upper right", fontsize=7, ncol=legend_cols, framealpha=0.85)
+        self.fig.text(0.5, 0.012, footer, ha="center", va="bottom", fontsize=8, linespacing=1.5)
+        self.fig.tight_layout(rect=(0, 0.06, 1, 1))     # keep the footer clear of the map
+        self.fig.savefig(out_png, dpi=MAP_DPI)
+        plt.close(self.fig)
+        return out_png
 
 
 def draw_route_map(kind, v, coords, depot_xy, outline, out_png, actual_routes=()):
-    """Straight-line map of one planned route: depot, stops in visiting order, back to depot.
+    """One planned route (blue) with the actual routes that served its areas that day (grey, behind).
 
-    actual_routes (rows from actual_route_rows) are drawn underneath as dashed loops,
-    each re-ordered with vehicle_route, and listed in the legend with route ID, day and km.
+    Footer: planned against actual km, kg and fill.
     """
     depot, order, km = v["Depot"], v["Order"], v["Route km"]
     if not order:
         print(f"No located areas on {depot} {v['Day']} {v['Type']} vehicle {v['Vehicle']}, map skipped")
         return None
-
-    # coords are km; the outline is in metres (EPSG 27700), so convert here
-    def to_xy(route):
-        return [(depot_xy[depot][0] * 1000, depot_xy[depot][1] * 1000) if node == DEPOT_KEY
-                else (coords[node][0] * 1000, coords[node][1] * 1000) for node in route]
-
-    xy = to_xy(order)
-    xs, ys = [p[0] for p in xy], [p[1] for p in xy]
-    stops = [p for node, p in zip(order, xy) if node != DEPOT_KEY]
-
-    fig, ax = plt.subplots(figsize=(7, 7))
-    if outline is not None:
-        outline.plot(ax=ax, color="#dedede", edgecolor="white", linewidth=0.3)
-
-    all_x, all_y = list(xs), list(ys)
-    for i, r in enumerate(sorted(actual_routes, key=lambda r: (DAYS.index(r["Day"]), str(r["Route"])))):
-        a_order = vehicle_route(sorted(split_areas(r["Areas"])), coords, depot_xy[depot])[0]
-        if not a_order:
-            continue
-        a_xy = to_xy(a_order)
-        ax_, ay_ = [p[0] for p in a_xy], [p[1] for p in a_xy]
-        colour = ACTUAL_COLOURS[i % len(ACTUAL_COLOURS)]
-        ax.plot(ax_, ay_, color=colour, linewidth=1.0, linestyle="--", zorder=1,
-                label=f"Actual {r['Route']} {r['Day'][:3]}: {r['Route km']:.0f} km")
-        ax.scatter(ax_[1:-1], ay_[1:-1], s=10, color=colour, linewidths=0, zorder=1)
-        all_x += ax_
-        all_y += ay_
-
-    ax.plot(xs, ys, color="#1f5fa8", linewidth=1.2, zorder=2,
-            label=f"Planned {v['Day'][:3]}: {km:.0f} km")
-    if stops:
-        ax.scatter([p[0] for p in stops], [p[1] for p in stops], s=18,
-                   color="#1f5fa8", linewidths=0, zorder=3)
-    ax.scatter([xy[0][0]], [xy[0][1]], marker="*", s=220, color="#c00000", zorder=4)
-
-    span = max(max(all_x) - min(all_x), max(all_y) - min(all_y))
-    pad = max(span * 0.1, 5000)
-    ax.set_xlim(min(all_x) - pad, max(all_x) + pad)
-    ax.set_ylim(min(all_y) - pad, max(all_y) + pad)
-    ax.set_aspect("equal")
-    ax.set_axis_off()
-    n_areas = len(v["Areas"].split(", ")) if v["Areas"] else 0
-    ax.set_title(f"{depot} {v['Day']} {v['Type']} vehicle {v['Vehicle']} ({kind.lower()}, week {v['Week']})\n"
-                 f"{km:.0f} km loop, {drops(v)} drops, {v['KG']:,.0f} kg",
-                 fontsize=11, fontweight="bold")
+    m = MapFrame(depot, coords, depot_xy, outline)
     if actual_routes:
-        ax.legend(loc="upper center", bbox_to_anchor=(0.5, 0.0), ncol=2, fontsize=7, frameon=False,
-                  title=f"Actual routes, same week, sharing an area ({len(actual_routes)})", title_fontsize=7)
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=MAP_DPI, bbox_inches="tight")
-    plt.close(fig)
-    return out_png
+        m.ax.plot([], [], color=ACTUAL_COLOUR, linestyle="--", linewidth=0.9,
+                  label=f"Actual, same day ({len(actual_routes)})")
+    for r in actual_routes:
+        m.actual(r)
+    m.loop(order, PLANNED_COLOUR, 1.4, 3, label="Planned", dot=18)
+    title = (f"{depot} {v['Day']} {v['Type']} vehicle {v['Vehicle']} ({kind.lower()}, week {v['Week']})\n"
+             f"{km:.0f} km loop, {drops(v)} drops, {v['KG']:,.0f} kg")
+    return m.save(title, compare_footer([v], actual_routes), out_png)
+
+
+def draw_day_map(depot, day, week, planned, actual_routes, coords, depot_xy, outline, out_png):
+    """All planned routes for one depot, day and week in different colours; actual routes grey behind."""
+    m = MapFrame(depot, coords, depot_xy, outline)
+    if actual_routes:
+        m.ax.plot([], [], color=ACTUAL_COLOUR, linestyle="--", linewidth=0.9,
+                  label=f"Actual ({len(actual_routes)})")
+    for r in actual_routes:
+        m.actual(r, label=False)
+    for i, v in enumerate(sorted(planned, key=lambda v: v["Vehicle"])):
+        m.loop(v["Order"], DAY_MAP_COLOURS[i % len(DAY_MAP_COLOURS)], 1.3, 3,
+               label=f"{v['Type']} {v['Vehicle']}: {v['Route km']:.0f} km, {v['KG']:,.0f} kg")
+    title = f"{depot} {day}, week {week}: all planned routes"
+    return m.save(title, compare_footer(planned, actual_routes), out_png,
+                  legend_cols=2 if len(planned) > 8 else 1)
+
+
+def safe_name(name):
+    return name.replace(" ", "_").replace("/", "_")
 
 
 # ---- Main -----------------------------------------------------------------
@@ -1112,11 +1172,25 @@ def main():
         outline = load_uk_outline()
         for kind, v in example_routes:
             name = (f"{v['Depot']}_{v['Day']}_week_{v['Week']}_{v['Type']}_vehicle_{v['Vehicle']}_{kind}.png")
-            png = draw_route_map(kind, v, coords, depot_xy, outline,
-                                 run_dir / name.replace(" ", "_").replace("/", "_"),
+            png = draw_route_map(kind, v, coords, depot_xy, outline, run_dir / safe_name(name),
                                  matching_actual_routes(v, actual))
             if png:
                 print(f"Saved {png}")
+
+        if DAY_MAPS:
+            # every weekday, for each depot and week that has an example route
+            day_dir = run_dir / "Day maps"
+            day_dir.mkdir(exist_ok=True)
+            for depot, week in sorted({(v["Depot"], v["Week"]) for _, v in example_routes}):
+                for day in DAYS:
+                    planned = [v for v in planned_vehicles
+                               if (v["Depot"], v["Day"], v["Week"]) == (depot, day, week)]
+                    if not planned:
+                        continue
+                    act = [r for r in actual if (r["Depot"], r["Day"], r["Week"]) == (depot, day, week)]
+                    png = draw_day_map(depot, day, week, planned, act, coords, depot_xy, outline,
+                                       day_dir / safe_name(f"{depot}_{DAYS.index(day) + 1}_{day}_week_{week}.png"))
+                    print(f"Saved {png}")
 
     out = run_dir / f"Example_weeks_{RUN_STAMP}.xlsx"
     with pd.ExcelWriter(out) as xl:
