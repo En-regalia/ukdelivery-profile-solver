@@ -40,8 +40,18 @@ MATRIX_OPTIONS = {
 }
 
 
-def select_matrix_path():
-    """Ask in the terminal which matrix to use. Repeats until a valid, existing file is chosen."""
+MATRIX_PATH = None        # set by full_run.py: every step then uses this matrix without asking again
+
+
+def select_matrix_path(must_exist=True):
+    """Ask in the terminal which matrix to use. Repeats until a valid, existing file is chosen.
+
+    If MATRIX_PATH has been set (full_run.py), it is returned without asking.
+    must_exist=False accepts a file that does not exist yet (the built matrix
+    before build_matrix has run).
+    """
+    if MATRIX_PATH is not None:
+        return MATRIX_PATH
     print("\nWhich matrix should the solver use?")
     for key, (label, path) in MATRIX_OPTIONS.items():
         print(f"  {key}. {label}\n     {path}")
@@ -51,7 +61,7 @@ def select_matrix_path():
             print("Please enter 1 or 2.")
             continue
         path = MATRIX_OPTIONS[choice][1]
-        if not path.exists():
+        if must_exist and not path.exists():
             print(f"File not found: {path}")
             continue
         return path
