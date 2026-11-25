@@ -24,7 +24,7 @@ MAX_KM = 150                 # flag areas further than this from their chosen de
 
 # ---- Depot settings --------------------------------------------------------------
 
-# Leave empty to use every depot in the depot info file
+# Only these depots are assigned areas. Leave empty to use every depot in the depot info file.
 ACTIVE_DEPOTS = ["Watford", "Doncaster", "Bristol Outbase", "Warrington"]
 
 locked = {"Bristol Outbase"}  # areas that are locked to their current depot
@@ -72,17 +72,15 @@ def assign_depots(helper, depot_xy):
     for j, n in enumerate(names):
         score[helper[DEPOT].to_numpy() == n, j] -= PREFERRED_BONUS_KM
 
+    # Locked depots keep their own areas and take on no others. Areas whose current
+    # depot is not active (or blank) have no bonus and go to the nearest active depot.
+    locked_cols = [names.index(d) for d in locked if d in names]
     for i in range(len(helper)):
         current_depot = helper.iloc[i][DEPOT]
-        cd_column = names.index(current_depot)
-        if current_depot in locked:
-            score[i,cd_column] = -np.inf
+        if current_depot in locked and current_depot in names:
+            score[i, names.index(current_depot)] = -np.inf
         else:
-            for d in locked:
-                locked_column = names.index(d)
-                score[i,locked_column] = np.inf
-
-                    
+            score[i, locked_cols] = np.inf
 
     best = score.argmin(axis=1)
     out = helper.copy()
@@ -102,16 +100,26 @@ def main():
     helper[DEPOT] = helper[DEPOT].str.strip()
     helper[EAST] = to_num(helper[EAST])
     helper[NORTH] = to_num(helper[NORTH])
-
-    # Names must match exactly between the two files
-    helper_depots = set(helper[DEPOT]) - {""}
-    no_location = helper_depots - set(depot_xy)
-    no_areas = set(depot_xy) - helper_depots
     print(f"Depot locations loaded: {', '.join(depot_xy)}")
-    if no_location:
-        raise SystemExit(f"Depots in helper with no location in depot info: {sorted(no_location)}")
+
+    # Only the active depots take part. Names must match the depot info Title exactly.
+    if ACTIVE_DEPOTS:
+        missing = [d for d in ACTIVE_DEPOTS if d not in depot_xy]
+        if missing:
+            raise SystemExit(f"ACTIVE_DEPOTS not found in depot info (check spelling): {missing}")
+        depot_xy = {d: depot_xy[d] for d in ACTIVE_DEPOTS}
+    print(f"Active depots: {', '.join(depot_xy)}")
+    inactive_locked = sorted(set(locked) - set(depot_xy))
+    if inactive_locked:
+        print(f"Note: locked depots that are not active are ignored: {inactive_locked}")
+
+    helper_depots = set(helper[DEPOT]) - {""}
+    no_areas = set(depot_xy) - helper_depots
     if no_areas:
-        print(f"Note: depot info has locations with no areas in the helper: {sorted(no_areas)}")
+        print(f"Note: active depots with no areas in the helper: {sorted(no_areas)}")
+    for d in sorted(helper_depots - set(depot_xy)):
+        print(f"Note: {(helper[DEPOT] == d).sum()} areas at {d} (not active) "
+              f"will move to the nearest active depot")
 
     result = assign_depots(helper, depot_xy)
 
