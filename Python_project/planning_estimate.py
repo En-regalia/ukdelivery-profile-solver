@@ -33,6 +33,12 @@ For the lowest, median and peak network weeks (by kg):
      carrying the most orders are kept and the rest of their orders are placed into them
      where they fit within the cap. Whatever cannot be placed is the fleet overflow.
   A new truck is only opened for an order whose own closed loop is within the cap.
+  Added-km limit: van selection and both consolidations only put an order on a
+  non-empty vehicle if it adds at most MAX_ADDED_KM (60) to that vehicle's loop, so
+  far-apart areas do not share a vehicle. Per depot and day the limit rises by 20 km
+  while the trucks are over the fleet, up to 150 km. A day still over the fleet there
+  is flagged in Summary ("Fleet cap unresolved") and trimmed as in step 3. The final
+  limit per depot and day is printed and shown in Daily and Summary.
 Both plans use the same packing and the same fleet limits, so the comparison
 is like for like.
 
@@ -88,6 +94,14 @@ FLEET_CAP = {             # vehicles available per depot per day, by type (depot
     "Aberdeen": {"HGV": 1, "Van": 0, "26t": 0},          # no team code or grid reference in this script yet, so not used
     "Renfrew": {"HGV": 4, "Van": 0, "26t": 1},           # no team code or grid reference in this script yet, so not used
 }
+# Added-km limit: an order may join a non-empty vehicle only if it adds at most this many km to
+# that vehicle's closed loop, so far-apart areas do not share a vehicle. Per depot and day the
+# limit starts at MAX_ADDED_KM and rises by ADDED_KM_STEP while the trucks are over the fleet,
+# up to ADDED_KM_CEILING. A day still over the fleet there is flagged "unresolved" and trimmed
+# to the fleet as before (fit_fleet: the extra orders go to the pallet network as "fleet").
+MAX_ADDED_KM = 60.0
+ADDED_KM_STEP = 20.0
+ADDED_KM_CEILING = 150.0
 ROUTE_DETAIL = True       # writes a "Route detail" sheet: every stop, leg and cumulative km (After plan)
 PLANNED_COLOUR = "#1f5fa8"  # single planned route on the example maps
 ACTUAL_COLOUR = "#9a9a9a"   # actual routes, drawn behind the planned ones
@@ -402,13 +416,24 @@ def route_km_fn(coords, depot_xy):
     return route_km
 
 
-def select_van_loads(eligible, n_vans, route_km, cap):
+def added_ok(current, area, route_km, limit):
+    """True if adding `area` to a vehicle serving `current` areas adds at most `limit` km to its loop.
+
+    An empty vehicle always passes (its first stop is limited by the route cap instead).
+    limit None means no limit.
+    """
+    if limit is None or not current or area in current:
+        return True
+    return route_km(current | {area}) - route_km(current) <= limit
+
+
+def select_van_loads(eligible, n_vans, route_km, cap, limit=None):
     """Choose the van-eligible orders that go on vans: as many orders as possible.
 
     Orders are taken smallest first (kg, then pallets). Each goes into the van, among
     the n_vans vans of the day, that it fills most tightly, provided the van's closed
-    route stays within cap (500 km, hard). Vans are not grouped by area. An order no
-    van can take is returned unplaced, for the trucks.
+    route stays within cap (500 km, hard) and the order adds at most `limit` km to the
+    van's loop (added_ok). An order no van can take is returned unplaced, for the trucks.
     n_vans None means no fleet limit.
     Returns (van loads, unplaced index labels).
     """
@@ -423,7 +448,8 @@ def select_van_loads(eligible, n_vans, route_km, cap):
         for v in loads:
             if not fits(v, kg, pal):
                 continue
-            if route_km(set(areas_of(v)) | {area}) > cap:
+            current = set(areas_of(v))
+            if route_km(current | {area}) > cap or not added_ok(current, area, route_km, limit):
                 continue
             left = spec["kg"] - (v["kg"] + kg)
             if best is None or left < best[0]:
@@ -462,13 +488,13 @@ def place(orders, route_km, cap, vtype="HGV"):
     return vehicles, cap_over
 
 
-def consolidate(vehicles, coords, route_km, caps):
+def consolidate(vehicles, coords, route_km, caps, limit=None):
     """Remove vans by moving their orders into the other vans.
 
     Smallest vehicles are tried first, and their orders largest first. Each order
     goes to the vehicle where the closed route adds the fewest km, provided the
-    load fits and the route stays within the cap. A vehicle is removed only
-    if every one of its orders is placed. Repeats until no vehicle can be emptied.
+    load fits, the route stays within the cap and the order adds at most `limit` km.
+    A vehicle is removed only if every one of its orders is placed. Repeats until no vehicle can be emptied.
     """
     changed = True
     while changed:
@@ -493,6 +519,8 @@ def consolidate(vehicles, coords, route_km, caps):
                     if new_km > cap:
                         continue
                     add = new_km - route_km(current)
+                    if current and limit is not None and add > limit:
+                        continue
                     if best is None or add < best[0]:
                         best = (add, dst)
                 if best is None:
@@ -506,11 +534,11 @@ def consolidate(vehicles, coords, route_km, caps):
     return vehicles
 
 
-def consolidate_trucks(trucks, coords, route_km, cap, lim26):
+def consolidate_trucks(trucks, coords, route_km, cap, lim26, limit=None):
     """Empty trucks into other trucks, so the fewest trucks are used.
 
     Smallest trucks are emptied first, and their orders largest first. Each order goes
-    to the truck where the closed route adds the fewest km. A truck that can't take an
+    to the truck where the closed route adds the fewest km, and at most `limit` km. A truck that can't take an
     order at 8t is upgraded to 26t if the 26t fleet has room (see can_take). A truck is
     removed only if every one of its orders is placed. Repeats until no truck can be emptied.
     """
@@ -534,6 +562,8 @@ def consolidate_trucks(trucks, coords, route_km, cap, lim26):
                     if new_km > cap:
                         continue
                     add = new_km - route_km(current)
+                    if current and limit is not None and add > limit:
+                        continue
                     if best is None or add < best[0]:
                         best = (add, dst)
                 if best is None:
@@ -591,11 +621,41 @@ def fit_fleet(trucks, fleet, route_km, cap):
     return kept, overflow
 
 
+def over_fleet(trucks, fleet):
+    """True if there are more 8t or 26t trucks than the depot's fleet allows."""
+    _, n8, n26 = type_counts(trucks)
+    return ((fleet["HGV"] is not None and n8 > fleet["HGV"])
+            or (fleet["26t"] is not None and n26 > fleet["26t"]))
+
+
 def pack(orders, coords, depot_xy, caps, fleet):
+    """Pack one depot-day, relaxing the added-km limit while the trucks are over the fleet.
+
+    Tries MAX_ADDED_KM, then steps of ADDED_KM_STEP up to ADDED_KM_CEILING. The first limit
+    whose trucks fit the fleet is used. If none does, the ceiling run is used and the day is
+    flagged unresolved: fit_fleet then trims it to the fleet, sending the rest to overflow.
+
+    Returns (vehicles, overflow DataFrame, final added-km limit, unresolved flag).
+    """
+    route_km = route_km_fn(coords, depot_xy)       # shared cache across the retries
+    limit = MAX_ADDED_KM
+    while True:
+        vehicles, overflow, over = pack_at(orders, coords, route_km, caps, fleet, limit)
+        if not over or limit >= ADDED_KM_CEILING:
+            return vehicles, overflow, limit, over
+        limit = min(limit + ADDED_KM_STEP, ADDED_KM_CEILING)
+
+
+def pack_at(orders, coords, route_km, caps, fleet, limit):
     """orders: rows with area, kg, pal for one depot and day.
 
     caps: type -> hard route km ceiling (trucks: depot cap; Van: 500 km).
     fleet: type -> most vehicles on the day (None = no limit).
+
+    limit: added-km limit for placing an order on a non-empty vehicle (added_ok). It applies
+    to the van selection and both consolidations. Stage 1 truck packing (place) only puts
+    an order with others from its own postcode area, so it adds no km there. fit_fleet,
+    the last-resort trim to the fleet, uses the route cap only.
 
     1. Van-eligible orders: select as many as possible onto the van fleet, with each
        van's route within 500 km.
@@ -606,13 +666,13 @@ def pack(orders, coords, depot_xy, caps, fleet):
     4. Trucks are trimmed to the fleet (fit_fleet). Orders that still do not fit are
        fleet overflow.
 
-    Returns (vehicles, overflow DataFrame with Reason "route cap", "too big" or "fleet").
+    Returns (vehicles, overflow DataFrame with Reason "route cap", "too big" or "fleet",
+    True if the trucks were over the fleet before fit_fleet).
     """
-    route_km = route_km_fn(coords, depot_xy)
     spec = VEHICLE_TYPES["Van"]
     eligible = (orders["kg"] <= spec["kg"]) & (orders["pal"] <= spec["pallets"])
 
-    van_loads, unplaced_van = select_van_loads(orders[eligible], fleet["Van"], route_km, caps["Van"])
+    van_loads, unplaced_van = select_van_loads(orders[eligible], fleet["Van"], route_km, caps["Van"], limit)
     rest = pd.concat([orders[~eligible], orders.loc[unplaced_van]])
     fits_8 = fits_type(rest, "HGV")
     fits_26 = fits_type(rest, "26t")
@@ -620,15 +680,16 @@ def pack(orders, coords, depot_xy, caps, fleet):
     hgv, cap_over_8 = place(rest[fits_8], route_km, caps["HGV"], "HGV")
     heavy, cap_over_26 = place(rest[~fits_8 & fits_26], route_km, caps["26t"], "26t")
 
-    trucks = consolidate_trucks(hgv + heavy, coords, route_km, caps["HGV"], fleet["26t"])
+    trucks = consolidate_trucks(hgv + heavy, coords, route_km, caps["HGV"], fleet["26t"], limit)
+    over = over_fleet(trucks, fleet)
     trucks, fleet_over = fit_fleet(trucks, fleet, route_km, caps["HGV"])
-    vans = consolidate(van_loads, coords, route_km, caps)
+    vans = consolidate(van_loads, coords, route_km, caps, limit)
 
     rows = ([("route cap", a, k, p) for a, k, p in cap_over_8 + cap_over_26]
             + [("too big", a, k, p) for a, k, p in too_big[["area", "kg", "pal"]].itertuples(index=False, name=None)]
             + [("fleet", a, k, p) for a, k, p in fleet_over])
     overflow = pd.DataFrame(rows, columns=["Reason", "area", "kg", "pal"])
-    return vans + trucks, overflow
+    return vans + trucks, overflow, over
 
 
 def vehicle_rows(week, depot, day, plan, vehicles, coords, depot_xy):
@@ -708,11 +769,14 @@ def simulate(label, wk, wo, plans, coords, depot_xy):
                                pallet_areas=pallet_areas, cache=cache)
 
         moved_out_total = moved_in_total = 0.0
+        limits = {"Before": [], "After": []}
         for day in DAYS:
             before = o[o["day"] == day]
             after = o[o["new_day"] == day]
-            veh_b, over_b = pack(before, coords, depot_xy[depot], caps, fleet)
-            veh_a, over_a = pack(after, coords, depot_xy[depot], caps, fleet)
+            veh_b, over_b, lim_b, unres_b = pack(before, coords, depot_xy[depot], caps, fleet)
+            veh_a, over_a, lim_a, unres_a = pack(after, coords, depot_xy[depot], caps, fleet)
+            limits["Before"].append(f"{day[:3]} {lim_b:.0f}{' UNRESOLVED' if unres_b else ''}")
+            limits["After"].append(f"{day[:3]} {lim_a:.0f}{' UNRESOLVED' if unres_a else ''}")
             moved_out = before.loc[(before["new_day"] != day) & (before["new_day"] != PALLET), "kg"].sum()
             moved_in = after.loc[after["day"] != day, "kg"].sum()
             moved_out_total += moved_out
@@ -761,12 +825,19 @@ def simulate(label, wk, wo, plans, coords, depot_xy):
                 "Over fleet after KG": fl_a_kg,
                 "KG after": round(after["kg"].sum()),
                 "Pallets after": round(after["pal"].sum(), 1),
+                "Added km limit before": lim_b,
+                "Added km limit after": lim_a,
+                "Fleet unresolved before": int(unres_b),
+                "Fleet unresolved after": int(unres_a),
             })
 
             for _, r in over_a.iterrows():
                 out["Overflow"].append({"Week": label, "Depot": depot, "Day": day, "Area": r["area"],
                                         "Reason": r["Reason"], "KG": round(r["kg"]),
                                         "Pallets": round(r["pal"], 1)})
+
+        for plan_name, parts in limits.items():
+            print(f"{label} {depot} {plan_name}: added km limit {', '.join(parts)}")
 
         mv = (o[(o["new_day"] != o["day"]) & (o["new_day"] != PALLET)]
               .groupby(["area", "day", "new_day"])
@@ -863,7 +934,11 @@ def summary_rows(label, res):
              ("Orders over route cap (after)", daily_pivot("Over route cap after orders")),
              ("Orders over fleet (after)", daily_pivot("Over fleet after orders")),
              ("Orders over route cap (before)", daily_pivot("Over route cap before orders")),
-             ("Orders over fleet (before)", daily_pivot("Over fleet before orders"))]
+             ("Orders over fleet (before)", daily_pivot("Over fleet before orders")),
+             ("Added km limit (after)", daily_pivot("Added km limit after")),
+             ("Added km limit (before)", daily_pivot("Added km limit before")),
+             ("Fleet cap unresolved (after, flag)", daily_pivot("Fleet unresolved after")),
+             ("Fleet cap unresolved (before, flag)", daily_pivot("Fleet unresolved before"))]
     for basis, counts in bases:
         counts = counts.reindex(index=actual.index, columns=DAYS).fillna(0).astype(int)
         for depot, row in counts.iterrows():
@@ -878,7 +953,9 @@ def summary_rows(label, res):
                          **{d: round(float(row[d]), 1) for d in DAYS},
                          "Total": round(float(row.sum()), 1)})
 
-    # Check only: packing stops at the fleet and the route ceilings, so these should always be zero
+    # Check only: packing stops at the fleet and the route ceilings, so these should always be zero.
+    # A day the added-km relaxation could not bring within the fleet is in "Fleet cap unresolved"
+    # instead; fit_fleet trims it, with the extra orders in "Orders over fleet".
     for vtype, name in [("Van", "Vans over fleet cap"), ("HGV", "HGVs over fleet cap"), ("26t", "26t over fleet cap")]:
         over = planned(vtype).reindex(index=actual.index, columns=DAYS).fillna(0)
         for depot, row in over.iterrows():
