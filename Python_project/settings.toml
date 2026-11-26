@@ -129,10 +129,13 @@ max_route_km = 400.0        # route cap: the closed loop depot -> area -> depot 
 route_caps_from_orders = true   # ...and within each depot's truck cap from its actual routes in the raw orders
                                 # file (C_OUTPUT_PATH), worked out as planning_estimate.py does ([routes] route_pct)
 # Capacity per depot per day is its [fleet] (vehicles by type) times a load per vehicle:
+#   "nominal" = the full [vehicles] kg and pallets, as if every vehicle were filled to the limit daily.
 #   "actual"  = the depot's average kg and pallets per actual route of that type in the raw orders
 #               (C_OUTPUT_PATH): what its vehicles really carry with the stops and km they run.
-#   "nominal" = the full [vehicles] kg and pallets, as if every vehicle were filled to the limit daily.
-capacity_basis = "actual"
+# capacity_basis applies to every depot not listed in [assignment.capacity_basis_by_depot].
+# A depot on "actual" (or with a kg target) is also "strict": flagged fallback areas cannot take it
+# over capacity; they go to the next-nearest depot or the pallet network instead.
+capacity_basis = "nominal"
 # true: areas the rules above cannot place go to their nearest depot anyway, flagged "may need
 # pallet network", so every postcode is covered. The anneal and the planning estimate then decide
 # what fits (far letters become external, orders over the route cap or fleet are listed).
@@ -152,6 +155,10 @@ preferred_bonus_km = 15
 # areas over it go to the next depot or the pallet network (over_target). A depot left out has no target.
 [assignment.max_kg_per_week]
 # "Bristol Outbase" = 40000
+
+# Per-depot capacity basis, overriding capacity_basis above. Only Bristol uses its actual loads.
+[assignment.capacity_basis_by_depot]
+"Bristol Outbase" = "actual"
 
 # Fill order: a depot listed here takes its areas furthest from the named depot first, instead of
 # largest margin first. With a Bristol target, the areas Bristol cuts are then the ones nearest Watford.

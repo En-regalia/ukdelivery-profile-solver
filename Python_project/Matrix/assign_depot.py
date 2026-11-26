@@ -65,7 +65,19 @@ ROUTE_CAP_KM = dict(S.get("route_cap_km", {}))   # per-depot cap set by hand: ov
 #              (C_OUTPUT_PATH), i.e. what its vehicles really carry with the stops and km they run.
 #   "nominal": the full [vehicles] kg and pallets (a vehicle filled to the limit every day).
 VEHICLE_TYPES = SETTINGS["vehicles"]
-CAPACITY_BASIS = S.get("capacity_basis", "actual")
+CAPACITY_BASIS = S.get("capacity_basis", "nominal")                       # every depot not listed below
+CAPACITY_BASIS_BY_DEPOT = dict(S.get("capacity_basis_by_depot", {}))      # e.g. {"Bristol Outbase": "actual"}
+
+
+def basis_for(depot):
+    return CAPACITY_BASIS_BY_DEPOT.get(depot, CAPACITY_BASIS)
+
+
+def strict_depot(depot):
+    """A depot whose capacity is also enforced on fallback areas: one with the "actual" basis or a
+    kg target. Other depots take fallback areas regardless of capacity, and the planning estimate's
+    fleet check decides what fits, as before."""
+    return basis_for(depot) == "actual" or depot in MAX_KG_PER_WEEK
 FALLBACK_TO_NEAREST = S.get("fallback_to_nearest", True)   # leftovers go to their nearest depot, flagged
 MAX_KG_PER_WEEK = dict(S.get("max_kg_per_week", {}))        # depot -> kg-per-week target (fill and fallback respect it)
 OVER_TARGET = S.get("over_target", "next")                  # area over a depot's target: "next" depot or "pallet" network
@@ -167,7 +179,7 @@ ACTUAL_LOAD = {}  # (depot, type) -> (average kg, average pallets) per actual ro
 def load_per_vehicle(depot, vtype):
     """(kg, pallets, source) one vehicle of this type at this depot is counted as carrying per day."""
     nominal = (VEHICLE_TYPES[vtype]["kg"], VEHICLE_TYPES[vtype]["pallets"], "nominal")
-    if CAPACITY_BASIS != "actual":
+    if basis_for(depot) != "actual":
         return nominal
     if (depot, vtype) in ACTUAL_LOAD:
         return (*ACTUAL_LOAD[(depot, vtype)], "actual")
@@ -355,9 +367,10 @@ def distance_stage(helper, depot_xy, volume, check_pallets=True):
     t["Flag"] = ""
     fallback_load = {d: [0.0, 0.0] for d in names}
     if FALLBACK_TO_NEAREST:
-        # Fallback areas respect the same capacity (and any kg target) as the fill. An area whose
-        # nearest depot is full goes to the next-nearest depot with room, if that is within MAX_KM and
-        # the route cap (OVER_TARGET = "next"), or else to the pallet network, flagged either way.
+        # At a "strict" depot (actual capacity basis or a kg target, e.g. Bristol) fallback areas respect
+        # the same capacity as the fill: an area whose nearest strict depot is full goes to the
+        # next-nearest depot, if that is within MAX_KM and the route cap (OVER_TARGET = "next"), or else
+        # to the pallet network, flagged either way. Other depots take fallback areas regardless.
         fb = t[(t["Reason"] != "") & (t["Reason"] != R_NO_GRID)].sort_values(["_order", AREA],
                                                                              ascending=[False, True])
         for i, r in fb.iterrows():
@@ -368,9 +381,10 @@ def distance_stage(helper, depot_xy, volume, check_pallets=True):
                 # A depot that is full (the fill stopped there, or this area would take it over its
                 # capacity or target) takes no fallback areas. Not topping up a full depot with a later,
                 # smaller area keeps the fill order (e.g. Bristol furthest from Watford first).
-                over = (load[d][0] + fallback_load[d][0] + kg > cap[d][1] or
-                        (check_pallets and load[d][1] + fallback_load[d][1] + r["Pallets per day"] > cap[d][2]))
-                if d in full or over:
+                over = strict_depot(d) and (
+                    load[d][0] + fallback_load[d][0] + kg > cap[d][1] or
+                    (check_pallets and load[d][1] + fallback_load[d][1] + r["Pallets per day"] > cap[d][2]))
+                if (d in full and strict_depot(d)) or over:
                     full.add(d)
                     if OVER_TARGET == "pallet":
                         flag = f"{d} full: pallet network ({why})"
@@ -480,7 +494,7 @@ def settings_rows(depot_xy, check_pallets):
         {"Setting": "MAX_ROUTE_KM", "Value": MAX_ROUTE_KM},
         {"Setting": "Route caps from actual routes", "Value": ", ".join(f"{k} {v}" for k, v in ROUTE_CAP.items()) or "none"},
         {"Setting": "Route caps set by hand", "Value": ", ".join(f"{k} {v}" for k, v in ROUTE_CAP_KM.items()) or "none"},
-        {"Setting": "Capacity basis", "Value": CAPACITY_BASIS},
+        {"Setting": "Capacity basis", "Value": f"{CAPACITY_BASIS}; " + (", ".join(f"{k} {v}" for k, v in CAPACITY_BASIS_BY_DEPOT.items()) or "no depot overrides")},
         {"Setting": "Vehicle sizes ([vehicles])", "Value": ", ".join(f"{t} {v['kg']} kg / {v['pallets']} pallets" for t, v in VEHICLE_TYPES.items())},
         {"Setting": "Pallet limit", "Value": "checked" if check_pallets else "not checked (no pallet column)"},
         {"Setting": "Orders file (volume)", "Value": str(ORDERS_PATH or "not set")},
@@ -496,7 +510,7 @@ def run_distance_stage(helper, depot_xy):
     checks = check_assignment(t, depot_xy)
     t = t.drop(columns=["_E", "_N"])
 
-    print(f"\nDepot loads (capacity per day: [fleet] vehicles x {CAPACITY_BASIS} load per vehicle)")
+    print("\nDepot loads (capacity per day: [fleet] vehicles x load per vehicle, see the Capacity sheet)")
     print(loads.to_string(index=False))
     print(f"\nFlagged (rules 2 to 5 could not place them): {len(leftovers)}"
           + ("  ->  given to their nearest depot" if FALLBACK_TO_NEAREST else "  ->  depot 'Leftover'"))
