@@ -26,6 +26,13 @@ Checks: the 0% run of each mode must reproduce simulate() on the unreduced week 
 (the After figures of planning_estimate for the same weeks). If it does not, the script
 stops and says where.
 
+Also written (turn off with --export-orders none / --customer-reports none):
+  Reduced orders/Orders_<mode>_<pct>_<stamp>.csv   the whole orders CSV in its own format, reduced;
+                                                   point C_OUTPUT_PATH at it to rerun the other steps
+  Reduced orders/Removed_<mode>_<pct>_<stamp>.csv  the orders taken out
+  Customer_report_<stamp>_<mode>_<pct>.xlsx        customer report at the reduced volume
+  Random orders uses the first seed for these.
+
 No prompts. Run, for example:
   python scenario_reduction.py --plan "C:/.../Anneal output/Run_2026-11-20_10-00" --matrix built
 
@@ -76,6 +83,12 @@ def parse_args(argv=None):
     p.add_argument("--timing-seeds", type=int, default=3,
                    help="seeds run first to time the run (default 3); the rest follow without asking")
     p.add_argument("--seed-start", type=int, default=1, help="first seed (default 1)")
+    p.add_argument("--export-orders", choices=["all", "none"], default="all",
+                   help="write the reduced order file (same columns as the orders CSV) and the removed "
+                        "orders for every mode and reduction (random orders: first seed). Default: all")
+    p.add_argument("--customer-reports", choices=["all", "none"], default="all",
+                   help="write a customer report (customer_report.build) for every mode and reduction "
+                        "(random orders: first seed). Default: all")
     return p.parse_args(argv)
 
 
@@ -341,6 +354,7 @@ def main(argv=None):
 
     # ---- 2. Scenarios
     scen_rows, removed_rows, dropped_rows = [], [], []
+    report_runs = {}      # (mode, p) -> simulate() results over all weeks, for the customer reports
 
     def run_one(wk, weekday, mode, p, seed):
         if mode == MODE_BLANKET:
@@ -350,6 +364,10 @@ def main(argv=None):
         else:
             red, info = reduce_area(weekday, p, area_dep, coords, depot_xy, mode == MODE_FAR)
         res = pe.simulate(wk, wk, red, plans, coords, depot_xy)
+        if mode != MODE_RANDOM or seed == seeds[0]:
+            kept = report_runs.setdefault((mode, p), {"Vehicles": [], "Orders": [], "Daily": []})
+            for k in kept:
+                kept[k] += res[k]
         so = res["Orders"][0]
         bo = base_orders[wk]
         for r in metric_rows(res, pe, None):
@@ -444,12 +462,22 @@ def main(argv=None):
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
     run_dir = Path(os.environ["P_OUTPUT_DIR"]) / f"Run_{stamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    export_rows = []
+    if args.export_orders == "all":
+        export_rows = export_orders(pd, pe, DAYS, orders_path, orders, pcts, seeds[0], area_dep, coords,
+                                    depot_xy, weeks, scen, run_dir, stamp)
+    report_rows = []
+    if args.customer_reports == "all":
+        report_rows = customer_reports(pd, pe, report_runs, removed, band_of, orders, args.plan, run_dir,
+                                       stamp, seeds[0])
     out = run_dir / f"Scenario_reduction_{stamp}.xlsx"
 
     checks = pd.concat([
         pd.DataFrame(check_rows).assign(Section="Baseline reproduction"),
         removed.assign(Section="KG removed against target"),
         pd.DataFrame(dropped_rows).assign(Section="Orders dropped"),
+        pd.DataFrame(export_rows).assign(Section="Order file export"),
     ], ignore_index=True)
     checks.insert(0, "Section", checks.pop("Section"))
 
@@ -462,6 +490,8 @@ def main(argv=None):
         summary.to_excel(xl, sheet_name="Summary", index=False)
         checks.to_excel(xl, sheet_name="Checks", index=False)
         pd.DataFrame(notes, columns=["Item", "Value"]).to_excel(xl, sheet_name="Notes", index=False)
+        if report_rows:
+            pd.DataFrame(report_rows).to_excel(xl, sheet_name="Reports", index=False)
     print(f"Saved {out}")
     return out
 
@@ -591,8 +621,141 @@ def notes_rows(args, orders_path, matrix_path, pcts, seeds, n_time, route_cap, p
              ("Route cache", f"vehicle_route memo by depot position and set of areas: {cache.misses:,} routed, "
                              f"{cache.hits:,} reused. Same values as a fresh call (baseline check uses the "
                              f"uncached routing for planning_estimate's side)"),
+             ("Reduced order files", "Orders_<mode>_<pct>.csv: the whole orders CSV, same columns and header, "
+                                     "with the reduction applied week by week to weekday orders by the same "
+                                     "rule as the scenarios (random orders: first seed), so the example weeks "
+                                     "match the Scenarios sheet exactly. Weekend rows, and rows planning_estimate "
+                                     "drops (unreadable date, unknown team code), are kept unchanged. Blanket "
+                                     "rewrites the kg and pallet columns as plain numbers. Area modes pick the "
+                                     "areas per week, so a borderline area can be removed in one week and kept "
+                                     "in another. Removed_<mode>_<pct>.csv: the rows taken out (Blanket: each "
+                                     "order's removed share). Point C_OUTPUT_PATH at an Orders file to run "
+                                     "the other steps on the reduced volume"),
+             ("Customer reports", "Customer_report_<stamp>_<mode>_<pct>.xlsx: customer_report.build on the "
+                                  "scenario's simulate() results, so before (current depots and days) and after "
+                                  "(new plan) are both at the reduced volume. Usual days per area come from the "
+                                  "unreduced order file. The Reports sheet lists them"),
              ("Timing", f"first {n_time} seeds + fixed modes {t_first:.0f} s; remaining seeds {t_rest:.0f} s; "
                         f"whole run {total_s:.0f} s")]
+    return rows
+
+
+
+# ---- Reduced order files and customer reports ------------------------------------------------
+def slug(mode, p):
+    return {MODE_BLANKET: "blanket", MODE_RANDOM: "random", MODE_FAR: "area_furthest",
+            MODE_NEAR: "area_nearest"}[mode] + f"_{round(p * 100)}pct"
+
+
+def number_text(values):
+    """Plain number text for the kg and pallet columns (no thousands separator, up to 3 decimals)."""
+    return [f"{v:.3f}".rstrip("0").rstrip(".") for v in values]
+
+
+def export_orders(pd, pe, DAYS, orders_path, orders, pcts, seed, area_dep, coords, depot_xy, weeks, scen,
+                  run_dir, stamp):
+    """Write Orders_<mode>_<pct>.csv and Removed_<mode>_<pct>.csv in the raw orders format.
+
+    Every week in the file is reduced (weekday rows), with the same functions as the scenarios.
+    Rows of the raw file are matched to load_orders rows by position: load_orders keeps the raw row
+    order and only drops rows with an unreadable date or an unknown team code.
+    """
+    raw = pd.read_csv(orders_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    date = pd.to_datetime(raw.iloc[:, pe.DATE_COL].str.strip(), format="%Y%m%d", errors="coerce")
+    keep = date.notna() & raw.iloc[:, pe.TEAM_COL].str.strip().map(pe.DEPOT_CODES).notna()
+    raw_idx = raw.index[keep.to_numpy()]
+    if len(raw_idx) != len(orders) or not (
+            raw.iloc[raw_idx, pe.AREA_COL].str.strip().to_numpy() == orders["area"].to_numpy()).all():
+        raise SystemExit("STOP: could not match the raw orders file to load_orders rows; no order files written")
+    kg_name, pal_name = raw.columns[pe.KG_COL], raw.columns[pe.PAL_COL]
+    weekday_all = orders[orders["day"].isin(DAYS)]
+    out_dir = run_dir / "Reduced orders"
+    out_dir.mkdir(exist_ok=True)
+    rows = []
+    for mode in MODES:
+        for p in pcts:
+            parts = []
+            for wk, wo in weekday_all.groupby("wk", sort=True):
+                w = wo.copy()
+                if mode == MODE_BLANKET:
+                    parts.append(reduce_blanket(w, p))
+                elif mode == MODE_RANDOM:
+                    parts.append(reduce_random(w, p, seed))
+                else:
+                    parts.append(reduce_area(w, p, area_dep, coords, depot_xy, mode == MODE_FAR)[0])
+            reduced = pd.concat(parts)
+            gone = weekday_all.index.difference(reduced.index)
+            kept_raw = raw.drop(index=raw_idx[gone])
+            if mode == MODE_BLANKET:
+                scaled = raw_idx[weekday_all.index]
+                removed_raw = raw.loc[scaled].copy()
+                kept_raw.loc[scaled, kg_name] = number_text(weekday_all["kg"] * (1 - p))
+                kept_raw.loc[scaled, pal_name] = number_text(weekday_all["pal"] * (1 - p))
+                removed_raw[kg_name] = number_text(weekday_all["kg"] * p)
+                removed_raw[pal_name] = number_text(weekday_all["pal"] * p)
+            else:
+                removed_raw = raw.loc[raw_idx[gone]]
+            name = slug(mode, p)
+            f_out, f_rem = out_dir / f"Orders_{name}_{stamp}.csv", out_dir / f"Removed_{name}_{stamp}.csv"
+            kept_raw.to_csv(f_out, index=False, encoding="utf-8-sig")
+            removed_raw.to_csv(f_rem, index=False, encoding="utf-8-sig")
+            print(f"Saved {f_out.name} and {f_rem.name}")
+
+            # check: reading the file back gives the scenario's reduced weekday kg in every example week
+            back = pe.load_orders(f_out)
+            back = back[back["day"].isin(DAYS)]
+            for wk in weeks:
+                want = reduced.loc[reduced["wk"] == wk, "kg"].sum()
+                got = back.loc[back["wk"] == wk, "kg"].sum()
+                rows.append({"Mode": mode, "Reduction %": round(p * 100), "Week": wk,
+                             "File": f_out.name, "Weekday KG in file": round(got, 1),
+                             "Weekday KG in scenario": round(want, 1), "Match": abs(got - want) < 0.5})
+            rows.append({"Mode": mode, "Reduction %": round(p * 100), "Week": "All weeks in file",
+                         "File": f_out.name, "Rows in": len(raw), "Rows out": len(kept_raw),
+                         "Rows removed": len(raw) - len(kept_raw),
+                         "Weekday KG in file": round(back["kg"].sum(), 1),
+                         "Weekday KG original": round(weekday_all["kg"].sum(), 1),
+                         "Actual KG removed %": round(100 * (1 - back["kg"].sum() / weekday_all["kg"].sum()), 2)
+                         if weekday_all["kg"].sum() else None})
+    bad = [r for r in rows if r.get("Match") is False]
+    if bad:
+        print(f"WARNING: {len(bad)} exported week(s) do not match the scenario kg; see Checks")
+    return rows
+
+
+def customer_reports(pd, pe, report_runs, removed, band_of, orders, plan, run_dir, stamp, seed):
+    """customer_report.build for each mode and reduction, with the scenario named on the front sheet."""
+    try:
+        import customer_report
+    except Exception as e:  # noqa: BLE001
+        print(f"Customer reports skipped: customer_report import failed: {type(e).__name__}: {e}")
+        return []
+    base_text = customer_report.R["scenario"]
+    rows = []
+    try:
+        for (mode, p), res in sorted(report_runs.items(), key=lambda t: (MODES.index(t[0][0]), t[0][1])):
+            r = removed[(removed["Mode"] == mode) & (removed["Reduction %"] == round(p * 100))]
+            if mode == MODE_RANDOM:
+                r = r[r["Seed"].astype(str) == str(seed)]
+            actual = r["Actual KG removed %"].mean()
+            plain = {MODE_BLANKET: f"every order {p * 100:g}% lighter",
+                     MODE_RANDOM: f"{p * 100:g}% of orders removed at random on each depot and day",
+                     MODE_FAR: f"whole postcode areas furthest from each depot removed until at least "
+                               f"{p * 100:g}% of its weight is gone",
+                     MODE_NEAR: f"whole postcode areas nearest each depot removed until at least "
+                                f"{p * 100:g}% of its weight is gone"}[mode]
+            got = f" ({actual:.1f}% removed on average)" if pd.notna(actual) and mode in (MODE_FAR, MODE_NEAR) else ""
+            customer_report.R["scenario"] = (f"{base_text} Volume scenario: {plain}{got}. Before and after "
+                                             f"are both at this lower volume.")
+            out = customer_report.build(run_dir, f"{stamp}_{slug(mode, p)}", band_of, res["Vehicles"],
+                                        pd.concat(res["Orders"]), res["Daily"], orders, plan)
+            print(f"Saved {out.name}")
+            rows.append({"Mode": mode, "Reduction %": round(p * 100),
+                         "Seed": seed if mode == MODE_RANDOM else "",
+                         "Average KG removed % (per depot)": round(actual, 2) if pd.notna(actual) else None,
+                         "Report": out.name})
+    finally:
+        customer_report.R["scenario"] = base_text
     return rows
 
 
