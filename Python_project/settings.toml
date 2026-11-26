@@ -33,8 +33,10 @@ source_date = "2026-11-01"
 active = ["Watford", "Doncaster", "Bristol Outbase", "Warrington"]
 
 # Depots that keep exactly their current postcode areas and take on no others.
+# Only used by the old "nearest" assignment method (see [assignment] method). The distance
+# stage replaces the Bristol lock with distance, tolerance and capacity rules.
 # Read by: Matrix/assign_depot.py, customer_report.py (status column)
-locked = ["Bristol Outbase"]
+locked = []
 
 # Depots that will close. They stay in the "before" figures as a comparator, get no
 # areas in the new plan, and are left out of the total fleet.
@@ -58,7 +60,8 @@ closing = ["Solihull"]
 # Vehicles available per depot per day, by type. A depot or type left out has no limit.
 # The total fleet is the sum of these over the active depots (closing depots excluded).
 # Read by: planning_estimate.py (packing stops at these), sweep_plan.py (HGV + 26t = truck
-#          cap), customer_report.py (total fleet, allocation flags)
+#          cap), customer_report.py (total fleet, allocation flags),
+#          Matrix/assign_depot.py (kg and pallet limit per depot in the distance stage)
 "Watford"         = { HGV = 14, Van = 4, 26t = 2 }
 "Warrington"      = { HGV = 6,  Van = 1, 26t = 0 }
 "Doncaster"       = { HGV = 4,  Van = 0, 26t = 0 }
@@ -113,11 +116,58 @@ neighbours = 4
 # -------------------------------------------------------------------------------------
 [assignment]
 # -------------------------------------------------------------------------------------
-# The current depot is treated as this many km closer, so an area only moves when another
-# depot is clearly nearer. Read by: Matrix/assign_depot.py
+# All read by: Matrix/assign_depot.py
+# method = "distance": the depot-assignment stage (nearest depot, tolerance band, max distance,
+#          fill by capacity with a route-km check; areas no depot can take go to a leftovers list).
+# method = "nearest": the old method (nearest depot with a bonus for the current one, plus locked depots).
+method = "distance"
+
+# Distance stage. Only active depots that are not closing take part in the nearest-depot test.
+tolerance_km = 15           # a depot is eligible only if it is at least this many km nearer than the next-nearest
+max_km = 150                # an area further than this from its nearest depot is flagged, not assigned
+max_route_km = 400.0        # route cap: the closed loop depot -> area -> depot must fit within this...
+route_caps_from_orders = true   # ...and within each depot's truck cap from its actual routes in the raw orders
+                                # file (C_OUTPUT_PATH), worked out as planning_estimate.py does ([routes] route_pct)
+# Capacity per depot per day is its [fleet] (vehicles by type) times a load per vehicle:
+#   "nominal" = the full [vehicles] kg and pallets, as if every vehicle were filled to the limit daily.
+#   "actual"  = the depot's average kg and pallets per actual route of that type in the raw orders
+#               (C_OUTPUT_PATH): what its vehicles really carry with the stops and km they run.
+# capacity_basis applies to every depot not listed in [assignment.capacity_basis_by_depot].
+# A depot on "actual" (or with a kg target) is also "strict": flagged fallback areas cannot take it
+# over capacity; they go to the next-nearest depot or the pallet network instead.
+capacity_basis = "nominal"
+# true: areas the rules above cannot place go to their nearest depot anyway, flagged "may need
+# pallet network", so every postcode is covered. The anneal and the planning estimate then decide
+# what fits (far letters become external, orders over the route cap or fleet are listed).
+# false: those areas get the depot "Leftover" and all their orders go to the pallet network.
+fallback_to_nearest = true
+# What happens to an area whose nearest depot is at its kg target ([assignment.max_kg_per_week]):
+# "next" = it goes to the next-nearest depot with room, flagged; "pallet" = pallet network, flagged.
+over_target = "next"
+# Column in the orders file (ORDERS_PATH) with pallets per order. Leave "" if there is none:
+# the pallet limit is then not checked, and the run says so.
+pallet_col = ""
+
+# Old "nearest" method only: the current depot is treated as this many km closer.
 preferred_bonus_km = 15
-# Areas further than this from their chosen depot are flagged for review. Read by: Matrix/assign_depot.py
-max_km = 150
+
+# kg-per-week target per depot (for example to shrink Bristol). The fill stops at it, and fallback
+# areas over it go to the next depot or the pallet network (over_target). A depot left out has no target.
+[assignment.max_kg_per_week]
+# "Bristol Outbase" = 40000
+
+# Per-depot capacity basis, overriding capacity_basis above. Only Bristol uses its actual loads.
+[assignment.capacity_basis_by_depot]
+"Bristol Outbase" = "actual"
+
+# Fill order: a depot listed here takes its areas furthest from the named depot first, instead of
+# largest margin first. With a Bristol target, the areas Bristol cuts are then the ones nearest Watford.
+[assignment.fill_furthest_from]
+"Bristol Outbase" = "Watford"
+
+# Per-depot route cap set by hand, in km. Overrides the cap from the orders file (still never above
+# max_route_km). A depot left out uses the cap from the orders, or max_route_km.
+[assignment.route_cap_km]
 
 
 # -------------------------------------------------------------------------------------
@@ -149,6 +199,7 @@ kg_tolerance = 0.10         # a group's kg may differ from its target by this sh
 tour_starts = 20            # starting points tried per route (speed against accuracy)
 make_maps = true            # draw the day maps into each depot workbook
 auto_open = true            # open the run folder when finished (full_run.py turns this off)
+SMALL_DEPOT_ZONES = 20      # Set the number of zones before the anneal groups.
 
 # Route baseline per depot, km (95th percentile of planned route lengths, from baseline_length.py)
 [anneal.route_baseline_km]
