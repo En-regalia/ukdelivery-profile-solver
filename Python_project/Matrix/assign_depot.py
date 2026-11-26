@@ -15,8 +15,8 @@ Two methods (settings.toml [assignment] method):
   5. Route-km check: before each addition, the closed loop depot -> area -> depot (routing.vehicle_route)
      must fit within the depot's route cap. An area that breaks it is skipped.
   6. Fallback (FALLBACK_TO_NEAREST, default on): every area rules 2 to 5 could not place goes to
-     its nearest depot anyway (or, if that depot is at its MAX_KG_PER_WEEK target, to the next-nearest
-     depot with room, or the pallet network, per OVER_TARGET), flagged with the reason ("may need pallet network"), so no postcode
+     its nearest depot anyway (or, if that depot is full, e.g. Bristol at its capacity or target, to the
+     next-nearest depot with room, however far, or the pallet network if OVER_TARGET = "pallet"), flagged with the reason ("may need pallet network"), so no postcode
      is left uncovered. The anneal and the planning estimate then decide: the anneal treats far
      letters as external (pallet network), and the planning estimate's route cap and fleet checks
      list any orders that still do not fit. The flagged areas are on the "Flagged" sheet.
@@ -369,8 +369,8 @@ def distance_stage(helper, depot_xy, volume, check_pallets=True):
     if FALLBACK_TO_NEAREST:
         # At a "strict" depot (actual capacity basis or a kg target, e.g. Bristol) fallback areas respect
         # the same capacity as the fill: an area whose nearest strict depot is full goes to the
-        # next-nearest depot, if that is within MAX_KM and the route cap (OVER_TARGET = "next"), or else
-        # to the pallet network, flagged either way. Other depots take fallback areas regardless.
+        # next-nearest depot with room, however far (OVER_TARGET = "next"), flagged. Other depots take
+        # fallback areas regardless of capacity.
         fb = t[(t["Reason"] != "") & (t["Reason"] != R_NO_GRID)].sort_values(["_order", AREA],
                                                                              ascending=[False, True])
         for i, r in fb.iterrows():
@@ -390,12 +390,13 @@ def distance_stage(helper, depot_xy, volume, check_pallets=True):
                         flag = f"{d} full: pallet network ({why})"
                         break
                     continue                          # "next": try the next-nearest depot
-                if rank > 0 and (dist[i, k] > MAX_KM or 2 * dist[i, k] > route_cap(d)):
-                    flag = f"{names[order[i][0]]} full, next depot too far: pallet network ({why})"
-                    break                             # never move an area to a far depot just to cut a target
+                # The next-nearest depot with room takes the area even if it is beyond MAX_KM or the
+                # route cap: the flag says so, and the planning estimate's route cap decides what fits.
+                far = rank > 0 and (dist[i, k] > MAX_KM or 2 * dist[i, k] > route_cap(d))
                 choice = d
                 flag = (f"Fallback ({why}): may need pallet network" if rank == 0 else
-                        f"{names[order[i][0]]} full: moved to {d} ({why})")
+                        f"{names[order[i][0]]} full: moved to {d} ({why})"
+                        + (f", {dist[i, k]:.0f} km away: may need pallet network" if far else ""))
                 break
             t.at[i, "Flag"] = flag or "Every depot full: pallet network"
             if choice:
