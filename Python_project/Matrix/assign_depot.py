@@ -1,8 +1,24 @@
 """Assign each postcode area to a depot by straight-line distance on the British National Grid.
 
-Two methods (settings.toml [assignment] method):
+Three methods (settings.toml [assignment] method):
 
-"distance" (default): the depot-assignment stage.
+"preference" (default): Watford first. Bristol only covers what Watford cannot reasonably do.
+  A depot can reasonably reach an area when the closed loop depot -> area -> depot fits within its
+  route cap, and it is no more than REACH_RATIO times as far as the area's nearest depot.
+  1. PREFERRED_DEPOT (Watford) takes every area it can reach, nearest to it first, up to its
+     MAX_FLEET capacity.
+  2. The other depots except the cover depot (Warrington, Doncaster) take what is left: each area
+     goes to its nearest depot that can reach it, nearest first, up to that depot's MAX_FLEET
+     capacity. An area over a full depot tries its next reachable depot.
+  3. COVER_DEPOT (Bristol) keeps or takes what no other depot can reach (or could, but is full).
+     These areas stay with it even over its capacity, flagged, so nothing goes back to a far depot.
+  4. Anything still left (no depot can reach it) goes to its nearest depot, flagged "may need
+     pallet network".
+  MAX_FLEET capacity: [assignment.max_fleet] vehicles by type x the [vehicles] kg and pallets x the
+  [report] fill_target (90%). A depot without a max_fleet entry uses its [fleet] and capacity basis.
+  The output lists vehicles needed per depot against today's [fleet] and the max fleet.
+
+"distance": the depot-assignment stage.
   1. Nearest-depot test across every active depot that is not closing.
   2. Tolerance band: an area is eligible only for its nearest depot, and only if that depot is
      at least TOLERANCE_KM nearer than the next-nearest. Areas not clearly nearer to any depot
@@ -83,6 +99,14 @@ MAX_KG_PER_WEEK = dict(S.get("max_kg_per_week", {}))        # depot -> kg-per-we
 OVER_TARGET = S.get("over_target", "next")                  # area over a depot's target: "next" depot or "pallet" network
 FILL_FURTHEST_FROM = dict(S.get("fill_furthest_from", {}))  # depot -> other depot: fill areas furthest from it first
 PALLET_COL = S.get("pallet_col", "").strip()  # pallets column in the orders file ("" = no pallet check)
+
+# Preference method
+PREFERRED_DEPOT = S.get("preferred_depot", "Watford")         # takes every area it can reasonably reach first
+COVER_DEPOT = S.get("cover_depot", "Bristol Outbase")         # only keeps or takes what no other depot can reach
+REACH_RATIO = S.get("reach_ratio", 2.0)                       # at most this many times the nearest depot's km
+MAX_FLEET = {d: dict(v) for d, v in S.get("max_fleet", {}).items()}   # depot -> {type: vehicles}, the ceiling
+FILL_TARGET = SETTINGS["report"]["fill_target"]               # each max_fleet vehicle counts at this fill
+MAKE_MAP = S.get("make_map", True)                            # draw the depot coverage map at the end
 
 # Orders file columns (same as Matrix/build_matrix.py)
 DATE_COL, WEIGHT_COL, STATE_COL = "date", "Weight", "stateText"
@@ -242,6 +266,7 @@ def orders_route_caps(helper, depot_xy):
 
 
 ROUTE_CAP = {}    # depot -> km, filled by run_distance_stage
+LAST_WORKBOOK = [None]   # the run's Depot_assignment workbook, for the coverage map
 
 
 def route_cap(depot):
@@ -428,6 +453,223 @@ def distance_stage(helper, depot_xy, volume, check_pallets=True):
     return t, leftovers, loads
 
 
+# ---- Preference method ----------------------------------------------------
+R_COVER = "Cover depot"          # no other depot can reach it (or those that can are full)
+R_OUT_OF_REACH = "Out of reach"  # no depot can reach it within its route cap and the reach ratio
+
+
+def max_fleet_capacity(depots, check_pallets):
+    """depot -> (vehicles, kg per day, pallets per day, source). A depot in MAX_FLEET: its max fleet x
+    [vehicles] size x FILL_TARGET. Any other depot: depot_capacity ([fleet] x its capacity basis)."""
+    fleet_cap = depot_capacity([d for d in depots if d not in MAX_FLEET])
+    out = {}
+    for d in depots:
+        if d in MAX_FLEET:
+            unknown = set(MAX_FLEET[d]) - set(VEHICLE_TYPES)
+            if unknown:
+                raise SystemExit(f"[assignment.max_fleet] {d} uses vehicle types not in [vehicles]: {sorted(unknown)}")
+            f = MAX_FLEET[d]
+            kg = sum(n * VEHICLE_TYPES[t]["kg"] * FILL_TARGET for t, n in f.items())
+            pal = sum(n * VEHICLE_TYPES[t]["pallets"] * FILL_TARGET for t, n in f.items())
+            out[d] = (sum(f.values()), round(kg), round(pal, 1), f"max fleet at {FILL_TARGET:.0%} fill")
+        else:
+            n, kg, pal = fleet_cap[d]
+            out[d] = (n, kg, pal, f"[fleet], {basis_for(d)} load")
+        if d in MAX_KG_PER_WEEK:                       # a kg target still caps the fill
+            out[d] = (out[d][0], min(out[d][1], round(MAX_KG_PER_WEEK[d] / 5)), out[d][2], out[d][3] + ", kg target")
+    return out
+
+
+def preference_stage(helper, depot_xy, volume, check_pallets=True):
+    """Watford-first assignment table, flagged list and depot loads. See the module docstring."""
+    from routing import vehicle_route    # imported here so the "nearest" method does not need it
+
+    names = list(depot_xy)
+    for role, d in (("preferred_depot", PREFERRED_DEPOT), ("cover_depot", COVER_DEPOT)):
+        if d not in names:
+            raise SystemExit(f"[assignment] {role} '{d}' is not an active depot")
+    if PREFERRED_DEPOT == COVER_DEPOT:
+        raise SystemExit("[assignment] preferred_depot and cover_depot must be different depots")
+    P, C = names.index(PREFERRED_DEPOT), names.index(COVER_DEPOT)
+    others = [k for k in range(len(names)) if k not in (P, C)]
+
+    dep = np.array([depot_xy[n] for n in names], dtype=float)
+    pts = helper[[EAST, NORTH]].to_numpy(dtype=float)
+    dist = np.hypot(pts[:, None, 0] - dep[None, :, 0],
+                    pts[:, None, 1] - dep[None, :, 1]) / 1000   # km
+    order = np.argsort(dist, axis=1)
+    near, nxt = order[:, 0], order[:, 1]
+    rows_i = np.arange(len(helper))
+    d1, d2 = dist[rows_i, near], dist[rows_i, nxt]
+    no_grid = (pts[:, 0] <= 0) | (pts[:, 1] <= 0)
+
+    # Closed loop depot -> area -> depot for every area and depot, and whether the depot can reach it
+    areas = helper[AREA].to_numpy()
+    loop = np.zeros_like(dist)
+    for i in np.where(~no_grid)[0]:
+        axy = {areas[i]: (pts[i, 0] / 1000, pts[i, 1] / 1000)}
+        for k, n in enumerate(names):
+            loop[i, k] = vehicle_route([areas[i]], axy, (dep[k, 0] / 1000, dep[k, 1] / 1000))[1]
+    caps_km = np.array([route_cap(n) for n in names])
+    reach = (loop <= caps_km[None, :]) & (dist <= REACH_RATIO * d1[:, None] + 1e-9) & ~no_grid[:, None]
+
+    t = pd.DataFrame({
+        AREA: areas,
+        "Current depot": helper[DEPOT].to_numpy(),
+        "Nearest depot": [names[k] for k in near],
+        "Km to nearest": d1.round(1),
+        "Next depot": [names[k] for k in nxt],
+        "Km to next": d2.round(1),
+        "Margin km": (d2 - d1).round(1),
+        f"Km to {PREFERRED_DEPOT}": dist[:, P].round(1),
+        f"{PREFERRED_DEPOT} loop km": loop[:, P].round(1),
+        f"{PREFERRED_DEPOT} can reach": reach[:, P],
+        "Depots that can reach": [", ".join(names[k] for k in order[i] if reach[i, k]) for i in rows_i],
+    })
+    t["kg per day"] = volume.reindex(t[AREA])["kg"].fillna(0).round(1).to_numpy()
+    t["Pallets per day"] = volume.reindex(t[AREA])["pal"].fillna(0).round(2).to_numpy()
+    t[DEPOT] = ""
+    t["Km to chosen"] = np.nan
+    t["Loop km"] = np.nan
+    t["Rule"] = ""
+    t["Reason"] = ""
+    t["Flag"] = ""
+    kg_a, pal_a = t["kg per day"].to_numpy(), t["Pallets per day"].to_numpy()
+
+    cap = max_fleet_capacity(names, check_pallets)
+    load = {d: [0.0, 0.0] for d in names}
+    full = set()
+
+    def fits(i, k):
+        d = names[k]
+        return (load[d][0] + kg_a[i] <= cap[d][1] and
+                (not check_pallets or load[d][1] + pal_a[i] <= cap[d][2]))
+
+    def place(i, k, rule, reason="", flag=""):
+        d = names[k]
+        t.at[i, DEPOT] = d
+        t.at[i, "Km to chosen"] = round(float(dist[i, k]), 1)
+        t.at[i, "Loop km"] = round(float(loop[i, k]), 1)
+        t.at[i, "Rule"], t.at[i, "Reason"], t.at[i, "Flag"] = rule, reason, flag
+        load[d][0] += kg_a[i]
+        load[d][1] += pal_a[i]
+
+    placed = lambda i: t.at[i, DEPOT] != ""
+
+    # 1. Preferred depot takes every area it can reach, nearest to it first, up to its capacity.
+    for i in sorted(np.where(reach[:, P])[0], key=lambda i: (dist[i, P], areas[i])):
+        if fits(i, P):
+            place(i, P, f"1 {PREFERRED_DEPOT} first"
+                        + (f" (nearer: {names[near[i]]})" if near[i] not in (P, C) else ""))
+        else:
+            full.add(PREFERRED_DEPOT)
+
+    # 2. The other depots take what is left: nearest reachable depot first, nearest areas first.
+    #    An area over a full depot comes up again later in the list for its next reachable depot.
+    pairs = sorted(((dist[i, k], areas[i], i, k) for i in rows_i for k in others
+                    if reach[i, k] and not placed(i)))
+    for _, _, i, k in pairs:
+        if placed(i):
+            continue
+        if fits(i, k):
+            nearer_full = [names[j] for j in others if reach[i, j] and dist[i, j] < dist[i, k]]
+            place(i, k, "2 nearest depot that can reach it", reason=R_CAPACITY if nearer_full else "",
+                  flag=f"{', '.join(nearer_full)} full: moved to {names[k]}" if nearer_full else "")
+        else:
+            full.add(names[k])
+
+    # 3. Cover depot keeps or takes what no other depot can reach, or what those depots are too full
+    #    for. It keeps them even over its capacity (flagged), so nothing is pushed back to a far depot.
+    for i in sorted((i for i in rows_i if not placed(i) and reach[i, C]),
+                    key=lambda i: (dist[i, C], areas[i])):
+        could = [names[k] for k in [P] + others if reach[i, k]]
+        why = (f"{', '.join(could)} full" if could else f"no other depot can reach it")
+        over = not fits(i, C)
+        place(i, C, f"3 {COVER_DEPOT} cover", R_COVER,
+              f"{COVER_DEPOT} cover ({why})" + (f", over {COVER_DEPOT} capacity" if over else ""))
+        if over:
+            full.add(COVER_DEPOT)
+
+    # 4. Out of reach of every depot: nearest depot anyway, flagged.
+    for i in rows_i:
+        if placed(i) or no_grid[i]:
+            continue
+        k = near[i]
+        place(i, k, "4 fallback to nearest", R_OUT_OF_REACH,
+              f"Fallback (no depot can reach it within its route cap and {REACH_RATIO}x the nearest): "
+              "may need pallet network")
+    t.loc[no_grid, "Reason"] = R_NO_GRID
+    t.loc[no_grid, "Flag"] = "No depot: no grid reference"
+
+    t["Changed"] = t[DEPOT] != t["Current depot"]
+    leftovers = t[t["Flag"] != ""].copy()
+    fleet = fleet_caps()
+    veh_kg = VEHICLE_TYPES["HGV"]["kg"] * FILL_TARGET
+    before = (t.groupby("Current depot")["kg per day"].sum() * 5).to_dict()
+    loads = pd.DataFrame([{
+        "Depot": d, "Role": ("preferred" if d == PREFERRED_DEPOT else "cover" if d == COVER_DEPOT else ""),
+        "Route cap km": route_cap(d),
+        "Areas": int((t[DEPOT] == d).sum()),
+        "kg per week before (current depots)": round(before.get(d, 0)),
+        "kg per week after": round(5 * load[d][0]),
+        "kg per day": round(load[d][0]), "kg cap per day": cap[d][1], "Capacity from": cap[d][3],
+        "kg used": round(load[d][0] / cap[d][1], 3) if cap[d][1] else None,
+        "Pallets per day": round(load[d][1], 1) if check_pallets else None,
+        "Pallet cap": cap[d][2] if check_pallets else None,
+        "Full or over": "Yes" if d in full else "",
+        f"HGVs needed at {FILL_TARGET:.0%} fill (kg per day / {veh_kg:,.0f})": round(load[d][0] / veh_kg, 1),
+        "Vehicles today ([fleet])": sum(fleet.get(d, {}).values()),
+        "Vehicles max ([assignment.max_fleet])": sum(MAX_FLEET[d].values()) if d in MAX_FLEET else None,
+        "Areas flagged": int(((t[DEPOT] == d) & (t["Flag"] != "")).sum()),
+    } for d in names])
+    t.attrs["reach"], t.attrs["names"], t.attrs["cap"], t.attrs["load"] = reach, names, cap, load
+    return t, leftovers, loads
+
+
+def check_preference(t):
+    """Acceptance checks for the preference method. Returns rows of (check, result, detail)."""
+    names, reach = t.attrs["names"], t.attrs["reach"]
+    cap, load = t.attrs["cap"], t.attrs["load"]
+    k_of = {d: k for k, d in enumerate(names)}
+    rows = []
+    by_rule = t[t["Rule"].str[:1].isin(["1", "2", "3"])]
+    bad = [a for i, a, d in zip(by_rule.index, by_rule[AREA], by_rule[DEPOT]) if not reach[i, k_of[d]]]
+    rows.append({"Check": f"Areas placed by rules 1 to 3 are within their depot's route cap and {REACH_RATIO}x "
+                          "the nearest depot's km",
+                 "Result": "Pass" if not bad else "FAIL", "Detail": ", ".join(bad) or f"{len(by_rule)} areas"})
+    at_p = t[t[DEPOT] == PREFERRED_DEPOT]
+    strays = at_p[~at_p[f"{PREFERRED_DEPOT} can reach"]]
+    rows.append({"Check": f"No {PREFERRED_DEPOT} area beyond its reach (strays)",
+                 "Result": "Pass" if strays.empty else "Flagged",
+                 "Detail": ", ".join(strays[AREA]) or ""})
+    C = k_of[COVER_DEPOT]
+    gained = t[(t[DEPOT] == COVER_DEPOT) & (t["Current depot"] != COVER_DEPOT)]
+    bad = []
+    for i, r in gained.iterrows():
+        for k, d in enumerate(names):
+            if k != C and reach[i, k] and load[d][0] + r["kg per day"] <= cap[d][1]:
+                bad.append(f"{r[AREA]} ({d} had room)")
+                break
+    rows.append({"Check": f"{COVER_DEPOT} gains only areas no other depot could reach or take",
+                 "Result": "Pass" if not bad else "FAIL",
+                 "Detail": ", ".join(bad) or (f"gained: {', '.join(gained[AREA])}" if len(gained) else "gains none")})
+    before = 5 * t.loc[t["Current depot"] == COVER_DEPOT, "kg per day"].sum()
+    after = 5 * t.loc[t[DEPOT] == COVER_DEPOT, "kg per day"].sum()
+    rows.append({"Check": f"{COVER_DEPOT} does not grow (kg per week, before vs after)",
+                 "Result": "Pass" if after <= before + 0.5 else "Flagged",
+                 "Detail": f"{before:,.0f} before, {after:,.0f} after"})
+    over = [d for d in names if cap[d][1] and load[d][0] > cap[d][1] + 0.5]
+    rows.append({"Check": "Depots over their capacity", "Result": "Pass" if not over else "Flagged",
+                 "Detail": ", ".join(f"{d} {load[d][0]:,.0f} of {cap[d][1]:,.0f} kg per day" for d in over)})
+    unplaced = t[(t[DEPOT] == "") & (t["Flag"] == "")]
+    rows.append({"Check": "Every postcode area has a depot, or is flagged",
+                 "Result": "Pass" if unplaced.empty else "FAIL", "Detail": ", ".join(unplaced[AREA])})
+    no_reason = t[(t["Flag"] != "") & (t["Reason"] == "")]
+    rows.append({"Check": "Every flagged area has a reason", "Result": "Pass" if no_reason.empty else "FAIL",
+                 "Detail": ", ".join(no_reason[AREA]) or f"{int((t['Flag'] != '').sum())} flagged"})
+    return pd.DataFrame(rows)
+
+
 def check_assignment(t, depot_xy):
     """Acceptance checks. Returns rows of (check, result, detail)."""
     a = t[(t[DEPOT] != "") & (t["Reason"] == "")]          # placed by rules 2 to 5 (not fallback)
@@ -474,6 +716,16 @@ def capacity_rows(depot_xy):
     fleet = fleet_caps()
     rows = []
     for d in depot_xy:
+        if METHOD == "preference" and d in MAX_FLEET:
+            for t, n in MAX_FLEET[d].items():
+                if n:
+                    kg, pal = VEHICLE_TYPES[t]["kg"] * FILL_TARGET, VEHICLE_TYPES[t]["pallets"] * FILL_TARGET
+                    rows.append({"Depot": d, "Type": t, "Vehicles": n, "kg per vehicle": round(kg),
+                                 "Pallets per vehicle": round(pal, 1),
+                                 "Source": f"max fleet at {FILL_TARGET:.0%} fill",
+                                 "Nominal kg": VEHICLE_TYPES[t]["kg"], "Fill vs nominal": FILL_TARGET,
+                                 "kg per day": round(n * kg), "kg per week": round(5 * n * kg)})
+            continue
         for t, n in fleet.get(d, {}).items():
             if not n:
                 continue
@@ -499,22 +751,38 @@ def settings_rows(depot_xy, check_pallets):
         {"Setting": "Vehicle sizes ([vehicles])", "Value": ", ".join(f"{t} {v['kg']} kg / {v['pallets']} pallets" for t, v in VEHICLE_TYPES.items())},
         {"Setting": "Pallet limit", "Value": "checked" if check_pallets else "not checked (no pallet column)"},
         {"Setting": "Orders file (volume)", "Value": str(ORDERS_PATH or "not set")},
-    ])
+        {"Setting": "Method", "Value": METHOD},
+    ] + ([
+        {"Setting": "Preferred depot", "Value": PREFERRED_DEPOT},
+        {"Setting": "Cover depot", "Value": COVER_DEPOT},
+        {"Setting": "Reach ratio", "Value": REACH_RATIO},
+        {"Setting": "Max fleet", "Value": "; ".join(f"{d} " + ", ".join(f"{t} {n}" for t, n in f.items())
+                                                    for d, f in MAX_FLEET.items()) or "none"},
+        {"Setting": "Max fleet vehicles count at", "Value": f"{FILL_TARGET:.0%} fill ([report] fill_target)"},
+    ] if METHOD == "preference" else []))
 
 
 def run_distance_stage(helper, depot_xy):
     ROUTE_CAP.update(orders_route_caps(helper, depot_xy))
     volume, has_pal = load_area_volume(ORDERS_PATH, helper[AREA].str.strip().str.upper())
     volume.index = helper[AREA].to_numpy()
-    t, leftovers, loads = distance_stage(helper, depot_xy, volume, check_pallets=has_pal)
-    t["_E"], t["_N"] = helper[EAST].to_numpy(), helper[NORTH].to_numpy()
-    checks = check_assignment(t, depot_xy)
-    t = t.drop(columns=["_E", "_N"])
+    if METHOD == "preference":
+        t, leftovers, loads = preference_stage(helper, depot_xy, volume, check_pallets=has_pal)
+        checks = check_preference(t)
+    else:
+        t, leftovers, loads = distance_stage(helper, depot_xy, volume, check_pallets=has_pal)
+        t["_E"], t["_N"] = helper[EAST].to_numpy(), helper[NORTH].to_numpy()
+        checks = check_assignment(t, depot_xy)
+        t = t.drop(columns=["_E", "_N"])
 
-    print("\nDepot loads (capacity per day: [fleet] vehicles x load per vehicle, see the Capacity sheet)")
+    print("\nDepot loads (capacity per day: " + ("[assignment.max_fleet] at the fill target, else [fleet]"
+          if METHOD == "preference" else "[fleet] vehicles x load per vehicle") + ", see the Capacity sheet)")
     print(loads.to_string(index=False))
-    print(f"\nFlagged (rules 2 to 5 could not place them): {len(leftovers)}"
-          + ("  ->  given to their nearest depot" if FALLBACK_TO_NEAREST else "  ->  depot 'Leftover'"))
+    if METHOD == "preference":
+        print(f"\nFlagged: {len(leftovers)}")
+    else:
+        print(f"\nFlagged (rules 2 to 5 could not place them): {len(leftovers)}"
+              + ("  ->  given to their nearest depot" if FALLBACK_TO_NEAREST else "  ->  depot 'Leftover'"))
     if not leftovers.empty:
         print(leftovers.groupby("Reason").size().to_string())
         print(leftovers[[AREA, "Current depot", DEPOT, "Km to nearest", "Next depot",
@@ -524,7 +792,12 @@ def run_distance_stage(helper, depot_xy):
 
     cols = [AREA, "Current depot", DEPOT, "Km to chosen", "Nearest depot", "Km to nearest", "Next depot",
             "Km to next", "Margin km", "Loop km", "kg per day", "Pallets per day", "Changed", "Reason", "Flag"]
+    if METHOD == "preference":
+        cols[3:3] = ["Rule"]
+        cols += [f"Km to {PREFERRED_DEPOT}", f"{PREFERRED_DEPOT} loop km", f"{PREFERRED_DEPOT} can reach",
+                 "Depots that can reach"]
     out = DEPOT_OUT.parent / f"Depot_assignment_{RUN_STAMP}.xlsx"
+    LAST_WORKBOOK[0] = out
     out.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(out) as xl:
         t[cols].rename(columns={DEPOT: "Assigned depot"}).to_excel(xl, sheet_name="Assignment", index=False)
@@ -544,12 +817,85 @@ def run_distance_stage(helper, depot_xy):
     result["Km to depot"] = t["Km to chosen"].to_numpy()
     result["Changed"] = t["Changed"].to_numpy()
     result["Review"] = t["Flag"].to_numpy()
+    result["_kg"] = t["kg per day"].to_numpy()
     return result
+
+
+# ---- Coverage map ---------------------------------------------------------
+DEPOT_COLOURS = ["#1f5fa8", "#d9731a", "#2e8b57", "#a83279", "#7a5c2e", "#5a5a9e", "#c0392b", "#16a0a0"]
+DEPOT_INFO_XY = {}   # every depot in the depot info file (closing ones too), for the "current depots" map
+
+
+def draw_coverage_map(result, depot_xy, xlsx_path):
+    """Map of each depot and the postcode areas it covers: current depots beside the new assignment.
+
+    One dot per area at its grid reference, coloured by depot and sized by kg per day, with the area
+    letters beside it. Depots are stars. Flagged areas have a black ring. Saved as a PNG next to the
+    workbook and added to it as a "Map" sheet. The UK outline comes from MAP_IMAGE_PATH in .env, if set.
+    """
+    os.environ.setdefault("MAP_IMAGE_PATH", "")          # maps_common reads it at import
+    from maps_common import MAP_DPI, add_maps_sheet, load_uk_outline, plt
+
+    outline = load_uk_outline()
+    pts = result[(result[EAST] > 0) & (result[NORTH] > 0)].copy()
+    kg = pts["_kg"].to_numpy(dtype=float) if "_kg" in pts else np.zeros(len(pts))
+    peak = kg.max() if len(kg) and kg.max() > 0 else 1.0
+    size = 20 + 180 * np.sqrt(kg / peak)
+    shown = list(depot_xy) + sorted((set(pts["Current depot"]) | set(pts[DEPOT])) - set(depot_xy) - {"", LEFTOVER})
+    colour = {d: DEPOT_COLOURS[i % len(DEPOT_COLOURS)] for i, d in enumerate(shown)}
+    colour[LEFTOVER] = colour[""] = "#9a9a9a"
+    flagged = (pts["Review"].fillna("") != "").to_numpy()
+    all_xy = {**DEPOT_INFO_XY, **depot_xy}
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 11))
+    for ax, col, title in ((axes[0], "Current depot", "Current depots"), (axes[1], DEPOT, "New assignment")):
+        if outline is not None:
+            outline.plot(ax=ax, color="#e6e6e6", edgecolor="white", linewidth=0.3)
+        ax.scatter(pts[EAST], pts[NORTH], s=size, c=[colour.get(d, "#9a9a9a") for d in pts[col]],
+                   alpha=0.75, linewidths=0)
+        if col == DEPOT and flagged.any():
+            ax.scatter(pts.loc[flagged, EAST], pts.loc[flagged, NORTH], s=size[flagged] + 30,
+                       facecolors="none", edgecolors="black", linewidths=0.9)
+        for a, e, n in zip(pts[AREA], pts[EAST], pts[NORTH]):
+            ax.annotate(a, (e, n), xytext=(4, 3), textcoords="offset points", fontsize=7, color="#333333")
+        depots_here = [d for d in shown if d in set(pts[col])]
+        for d in depots_here:
+            if d in all_xy:
+                e, n = all_xy[d]
+                ax.scatter([e], [n], marker="*", s=420, c=colour[d], edgecolors="black", linewidths=1, zorder=5)
+                ax.annotate(d, (e, n), xytext=(8, -12), textcoords="offset points", fontsize=10, fontweight="bold")
+        legend = [plt.Line2D([], [], marker="o", ls="", color=colour[d], markersize=9,
+                             label=f"{d}: {(pts[col] == d).sum()} areas, "
+                                   f"{5 * kg[(pts[col] == d).to_numpy()].sum():,.0f} kg/wk")
+                  for d in depots_here]
+        if col == DEPOT and flagged.any():
+            legend.append(plt.Line2D([], [], marker="o", ls="", markerfacecolor="none", markeredgecolor="black",
+                                     markersize=9, label="Flagged (see Flagged sheet)"))
+        ax.legend(handles=legend, loc="upper left", fontsize=9, frameon=True)
+        if outline is not None:
+            minx, miny, maxx, maxy = outline.total_bounds
+            ax.set_xlim(minx, maxx)
+            ax.set_ylim(miny, maxy)
+        ax.set_aspect("equal")
+        ax.set_axis_off()
+        ax.set_title(title, fontsize=14, fontweight="bold")
+    fig.suptitle(f"Depot coverage by postcode area ({METHOD} method, run {RUN_STAMP})",
+                 fontsize=15, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    png = Path(xlsx_path).with_name(f"Depot_coverage_map_{RUN_STAMP}.png")
+    png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(png, dpi=MAP_DPI)
+    plt.close(fig)
+    on_sheet = Path(xlsx_path).exists()
+    if on_sheet:
+        add_maps_sheet(xlsx_path, png, sheet="Map")
+    print(f"Saved: {png}" + (" (also on the Map sheet)" if on_sheet else ""))
 
 
 # ---- Main -----------------------------------------------------------------
 def main():
     depot_xy = load_depot_locations(DEPOT_INFO_PATH)
+    DEPOT_INFO_XY.update(depot_xy)
     helper = read_csv_any(DEPOT_PATH)
     helper[DEPOT] = helper[DEPOT].str.strip()
     helper[EAST] = to_num(helper[EAST])
@@ -573,7 +919,7 @@ def main():
     for d in sorted(helper_depots - set(depot_xy)):
         print(f"Note: {(helper[DEPOT] == d).sum()} areas at {d} (not active) will be reassigned")
 
-    if METHOD == "distance":
+    if METHOD in ("distance", "preference"):
         result = run_distance_stage(helper, depot_xy)
     elif METHOD == "nearest":
         inactive_locked = sorted(set(locked) - set(depot_xy))
@@ -582,15 +928,23 @@ def main():
         result = assign_depots(helper, depot_xy)
         print(f"\nBeyond {MAX_KM} km: {(result['Review'] != '').sum()}")
     else:
-        raise SystemExit(f'[assignment] method must be "distance" or "nearest", not "{METHOD}"')
+        raise SystemExit(f'[assignment] method must be "preference", "distance" or "nearest", not "{METHOD}"')
 
     print("\nAreas per depot after assignment")
     print(result[DEPOT].value_counts().sort_index().to_string())
     print(f"\nAreas changing depot: {result['Changed'].sum()}")
 
     DEPOT_OUT.parent.mkdir(parents=True, exist_ok=True)
-    result.to_csv(DEPOT_OUT, index=False, encoding="utf-8-sig")
+    result.drop(columns="_kg", errors="ignore").to_csv(DEPOT_OUT, index=False, encoding="utf-8-sig")
     print(f"Saved: {DEPOT_OUT}")
+
+    # Final step: map of each depot and the areas it covers
+    if MAKE_MAP:
+        try:
+            draw_coverage_map(result, depot_xy,
+                              LAST_WORKBOOK[0] or DEPOT_OUT.parent / f"Depot_assignment_{RUN_STAMP}.xlsx")
+        except Exception as e:                 # the assignment is saved either way
+            print(f"Coverage map not drawn: {e}")
 
 
 if __name__ == "__main__":

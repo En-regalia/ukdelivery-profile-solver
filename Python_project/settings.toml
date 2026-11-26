@@ -117,10 +117,33 @@ neighbours = 4
 [assignment]
 # -------------------------------------------------------------------------------------
 # All read by: Matrix/assign_depot.py
+# method = "preference": Watford first. The preferred depot takes every area it can reasonably reach,
+#          the other depots take what is left nearest to them up to their max_fleet, and the cover depot
+#          (Bristol) only keeps or takes what no other depot can reach. See "Preference method" below.
 # method = "distance": the depot-assignment stage (nearest depot, tolerance band, max distance,
 #          fill by capacity with a route-km check; areas no depot can take go to a leftovers list).
 # method = "nearest": the old method (nearest depot with a bonus for the current one, plus locked depots).
-method = "distance"
+method = "preference"
+
+# ---- Preference method (method = "preference") ----
+# A depot can "reasonably reach" an area when both hold:
+#   - the closed loop depot -> area -> depot fits within the depot's route cap (max_route_km, the cap from
+#     the orders file, or [assignment.route_cap_km]), and
+#   - the depot is no more than reach_ratio times as far as the area's nearest depot.
+# Order: 1. preferred_depot takes every area it can reach, nearest to it first, up to its max_fleet.
+#        2. The other depots (not the cover depot) take what is left, each area going to its nearest
+#           depot that can reach it, nearest first, up to their max_fleet. An area over a full depot
+#           tries its next reachable depot, then the preferred depot.
+#        3. cover_depot keeps or takes what no other depot can reach. These areas stay with it even
+#           over its capacity, flagged "over capacity", so nothing is pushed back to a far depot.
+#        4. Anything still left goes to its nearest depot, flagged "may need pallet network".
+preferred_depot = "Watford"
+cover_depot = "Bristol Outbase"
+reach_ratio = 2.0
+
+# Final step (every method): a map of each depot and the postcode areas it covers, current depots beside
+# the new assignment. Saved as Depot_coverage_map_<run>.png and on a "Map" sheet in the workbook.
+make_map = true
 
 # Distance stage. Only active depots that are not closing take part in the nearest-depot test.
 tolerance_km = 15           # a depot is eligible only if it is at least this many km nearer than the next-nearest
@@ -155,6 +178,16 @@ preferred_bonus_km = 15
 # areas over it go to the next depot or the pallet network (over_target). A depot left out has no target.
 [assignment.max_kg_per_week]
 # "Bristol Outbase" = 40000
+
+# Preference method: the most vehicles each depot can run per day, by type. This is the ceiling the
+# assignment fills to; [fleet] stays today's fleet, which the planning estimate and the customer report
+# measure against. Each vehicle counts at the [report] fill_target (0.90 = 90% of its [vehicles] kg and
+# pallets), the fill the new grouping aims for. A depot left out (e.g. Bristol) uses its [fleet] and
+# capacity basis as in the distance method.
+[assignment.max_fleet]
+"Watford"    = { HGV = 20, Van = 6, 26t = 2 }
+"Warrington" = { HGV = 7,  Van = 1, 26t = 1 }
+"Doncaster"  = { HGV = 6,  Van = 1, 26t = 1 }
 
 # Per-depot capacity basis, overriding capacity_basis above. Only Bristol uses its actual loads.
 [assignment.capacity_basis_by_depot]
