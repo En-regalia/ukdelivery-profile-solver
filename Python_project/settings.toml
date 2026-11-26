@@ -141,6 +141,10 @@ preferred_depot = "Watford"
 cover_depot = "Bristol Outbase"
 reach_ratio = 2.0
 
+# Final step (every method): a map of each depot and the postcode areas it covers, current depots beside
+# the new assignment. Saved as Depot_coverage_map_<run>.png and on a "Map" sheet in the workbook.
+make_map = true
+
 # Distance stage. Only active depots that are not closing take part in the nearest-depot test.
 tolerance_km = 15           # a depot is eligible only if it is at least this many km nearer than the next-nearest
 max_km = 150                # an area further than this from its nearest depot is flagged, not assigned

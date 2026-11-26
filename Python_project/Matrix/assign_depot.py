@@ -106,6 +106,7 @@ COVER_DEPOT = S.get("cover_depot", "Bristol Outbase")         # only keeps or ta
 REACH_RATIO = S.get("reach_ratio", 2.0)                       # at most this many times the nearest depot's km
 MAX_FLEET = {d: dict(v) for d, v in S.get("max_fleet", {}).items()}   # depot -> {type: vehicles}, the ceiling
 FILL_TARGET = SETTINGS["report"]["fill_target"]               # each max_fleet vehicle counts at this fill
+MAKE_MAP = S.get("make_map", True)                            # draw the depot coverage map at the end
 
 # Orders file columns (same as Matrix/build_matrix.py)
 DATE_COL, WEIGHT_COL, STATE_COL = "date", "Weight", "stateText"
@@ -265,6 +266,7 @@ def orders_route_caps(helper, depot_xy):
 
 
 ROUTE_CAP = {}    # depot -> km, filled by run_distance_stage
+LAST_WORKBOOK = [None]   # the run's Depot_assignment workbook, for the coverage map
 
 
 def route_cap(depot):
@@ -795,6 +797,7 @@ def run_distance_stage(helper, depot_xy):
         cols += [f"Km to {PREFERRED_DEPOT}", f"{PREFERRED_DEPOT} loop km", f"{PREFERRED_DEPOT} can reach",
                  "Depots that can reach"]
     out = DEPOT_OUT.parent / f"Depot_assignment_{RUN_STAMP}.xlsx"
+    LAST_WORKBOOK[0] = out
     out.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(out) as xl:
         t[cols].rename(columns={DEPOT: "Assigned depot"}).to_excel(xl, sheet_name="Assignment", index=False)
@@ -814,12 +817,85 @@ def run_distance_stage(helper, depot_xy):
     result["Km to depot"] = t["Km to chosen"].to_numpy()
     result["Changed"] = t["Changed"].to_numpy()
     result["Review"] = t["Flag"].to_numpy()
+    result["_kg"] = t["kg per day"].to_numpy()
     return result
+
+
+# ---- Coverage map ---------------------------------------------------------
+DEPOT_COLOURS = ["#1f5fa8", "#d9731a", "#2e8b57", "#a83279", "#7a5c2e", "#5a5a9e", "#c0392b", "#16a0a0"]
+DEPOT_INFO_XY = {}   # every depot in the depot info file (closing ones too), for the "current depots" map
+
+
+def draw_coverage_map(result, depot_xy, xlsx_path):
+    """Map of each depot and the postcode areas it covers: current depots beside the new assignment.
+
+    One dot per area at its grid reference, coloured by depot and sized by kg per day, with the area
+    letters beside it. Depots are stars. Flagged areas have a black ring. Saved as a PNG next to the
+    workbook and added to it as a "Map" sheet. The UK outline comes from MAP_IMAGE_PATH in .env, if set.
+    """
+    os.environ.setdefault("MAP_IMAGE_PATH", "")          # maps_common reads it at import
+    from maps_common import MAP_DPI, add_maps_sheet, load_uk_outline, plt
+
+    outline = load_uk_outline()
+    pts = result[(result[EAST] > 0) & (result[NORTH] > 0)].copy()
+    kg = pts["_kg"].to_numpy(dtype=float) if "_kg" in pts else np.zeros(len(pts))
+    peak = kg.max() if len(kg) and kg.max() > 0 else 1.0
+    size = 20 + 180 * np.sqrt(kg / peak)
+    shown = list(depot_xy) + sorted((set(pts["Current depot"]) | set(pts[DEPOT])) - set(depot_xy) - {"", LEFTOVER})
+    colour = {d: DEPOT_COLOURS[i % len(DEPOT_COLOURS)] for i, d in enumerate(shown)}
+    colour[LEFTOVER] = colour[""] = "#9a9a9a"
+    flagged = (pts["Review"].fillna("") != "").to_numpy()
+    all_xy = {**DEPOT_INFO_XY, **depot_xy}
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 11))
+    for ax, col, title in ((axes[0], "Current depot", "Current depots"), (axes[1], DEPOT, "New assignment")):
+        if outline is not None:
+            outline.plot(ax=ax, color="#e6e6e6", edgecolor="white", linewidth=0.3)
+        ax.scatter(pts[EAST], pts[NORTH], s=size, c=[colour.get(d, "#9a9a9a") for d in pts[col]],
+                   alpha=0.75, linewidths=0)
+        if col == DEPOT and flagged.any():
+            ax.scatter(pts.loc[flagged, EAST], pts.loc[flagged, NORTH], s=size[flagged] + 30,
+                       facecolors="none", edgecolors="black", linewidths=0.9)
+        for a, e, n in zip(pts[AREA], pts[EAST], pts[NORTH]):
+            ax.annotate(a, (e, n), xytext=(4, 3), textcoords="offset points", fontsize=7, color="#333333")
+        depots_here = [d for d in shown if d in set(pts[col])]
+        for d in depots_here:
+            if d in all_xy:
+                e, n = all_xy[d]
+                ax.scatter([e], [n], marker="*", s=420, c=colour[d], edgecolors="black", linewidths=1, zorder=5)
+                ax.annotate(d, (e, n), xytext=(8, -12), textcoords="offset points", fontsize=10, fontweight="bold")
+        legend = [plt.Line2D([], [], marker="o", ls="", color=colour[d], markersize=9,
+                             label=f"{d}: {(pts[col] == d).sum()} areas, "
+                                   f"{5 * kg[(pts[col] == d).to_numpy()].sum():,.0f} kg/wk")
+                  for d in depots_here]
+        if col == DEPOT and flagged.any():
+            legend.append(plt.Line2D([], [], marker="o", ls="", markerfacecolor="none", markeredgecolor="black",
+                                     markersize=9, label="Flagged (see Flagged sheet)"))
+        ax.legend(handles=legend, loc="upper left", fontsize=9, frameon=True)
+        if outline is not None:
+            minx, miny, maxx, maxy = outline.total_bounds
+            ax.set_xlim(minx, maxx)
+            ax.set_ylim(miny, maxy)
+        ax.set_aspect("equal")
+        ax.set_axis_off()
+        ax.set_title(title, fontsize=14, fontweight="bold")
+    fig.suptitle(f"Depot coverage by postcode area ({METHOD} method, run {RUN_STAMP})",
+                 fontsize=15, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    png = Path(xlsx_path).with_name(f"Depot_coverage_map_{RUN_STAMP}.png")
+    png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(png, dpi=MAP_DPI)
+    plt.close(fig)
+    on_sheet = Path(xlsx_path).exists()
+    if on_sheet:
+        add_maps_sheet(xlsx_path, png, sheet="Map")
+    print(f"Saved: {png}" + (" (also on the Map sheet)" if on_sheet else ""))
 
 
 # ---- Main -----------------------------------------------------------------
 def main():
     depot_xy = load_depot_locations(DEPOT_INFO_PATH)
+    DEPOT_INFO_XY.update(depot_xy)
     helper = read_csv_any(DEPOT_PATH)
     helper[DEPOT] = helper[DEPOT].str.strip()
     helper[EAST] = to_num(helper[EAST])
@@ -859,8 +935,16 @@ def main():
     print(f"\nAreas changing depot: {result['Changed'].sum()}")
 
     DEPOT_OUT.parent.mkdir(parents=True, exist_ok=True)
-    result.to_csv(DEPOT_OUT, index=False, encoding="utf-8-sig")
+    result.drop(columns="_kg", errors="ignore").to_csv(DEPOT_OUT, index=False, encoding="utf-8-sig")
     print(f"Saved: {DEPOT_OUT}")
+
+    # Final step: map of each depot and the areas it covers
+    if MAKE_MAP:
+        try:
+            draw_coverage_map(result, depot_xy,
+                              LAST_WORKBOOK[0] or DEPOT_OUT.parent / f"Depot_assignment_{RUN_STAMP}.xlsx")
+        except Exception as e:                 # the assignment is saved either way
+            print(f"Coverage map not drawn: {e}")
 
 
 if __name__ == "__main__":
