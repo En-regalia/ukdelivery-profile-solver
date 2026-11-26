@@ -128,7 +128,11 @@ max_km = 150                # an area further than this from its nearest depot i
 max_route_km = 400.0        # route cap: the closed loop depot -> area -> depot must fit within this...
 route_caps_from_orders = true   # ...and within each depot's truck cap from its actual routes in the raw orders
                                 # file (C_OUTPUT_PATH), worked out as planning_estimate.py does ([routes] route_pct)
-# Capacity per depot per day is its [fleet] (vehicles by type) times the [vehicles] kg and pallets.
+# Capacity per depot per day is its [fleet] (vehicles by type) times a load per vehicle:
+#   "actual"  = the depot's average kg and pallets per actual route of that type in the raw orders
+#               (C_OUTPUT_PATH): what its vehicles really carry with the stops and km they run.
+#   "nominal" = the full [vehicles] kg and pallets, as if every vehicle were filled to the limit daily.
+capacity_basis = "actual"
 # true: areas the rules above cannot place go to their nearest depot anyway, flagged "may need
 # pallet network", so every postcode is covered. The anneal and the planning estimate then decide
 # what fits (far letters become external, orders over the route cap or fleet are listed).
