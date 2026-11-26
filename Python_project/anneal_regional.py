@@ -65,6 +65,8 @@ AUTO_OPEN = A["auto_open"]     # full_run.py sets this to False
 
 MAKE_MAPS = A["make_maps"]
 
+SMALL_DEPOT_ZONES = A["SMALL_DEPOT_ZONES"]  # skip steps 1 and 2 for depots with this many or fewer letter zones
+
 # ---- Route length cap -----------------------------------------------------
 # Baseline = 95th percentile of planned route lengths per depot (route_baseline.py)
 ROUTE_BASELINE_KM = dict(A["route_baseline_km"])
@@ -215,47 +217,51 @@ def build_groups(active, df, cap_km):
     R = max(1, min(len(zones), round(len(zones) / GROUP_SIZE)))
     target = sum(kg.values()) / R
 
-    # 1. Fill groups close to the target kg, taking the nearest zones first
-    unassigned = set(zones)
-    groups = []
-    for _ in range(R):
-        if not unassigned:
-            break
-        seed = max(unassigned, key=lambda z: kg[z])
-        unassigned.discard(seed)
-        grp, total = [seed], kg[seed]
-        while total < target * (1 - KG_TOLERANCE):
-            fits = [z for z in unassigned if total + kg[z] <= target * (1 + KG_TOLERANCE)]
-            if not fits:
+    if len(zones) <= SMALL_DEPOT_ZONES:
+        groups = [[z] for z in zones]    # one group per letter zone
+        # skip steps 1 and 2 (fill and KMeans split), go straight to step 3
+    else:
+        # 1. Fill groups close to the target kg, taking the nearest zones first
+        unassigned = set(zones)
+        groups = []
+        for _ in range(R):
+            if not unassigned:
                 break
-            gc = centre(grp)
-            pick = min(fits, key=lambda z: np.hypot(*(cen[z] - gc)))
-            grp.append(pick)
-            total += kg[pick]
-            unassigned.discard(pick)
-        groups.append(grp)
-    for z in unassigned:                      # leftovers join the nearest group
-        r = int(np.argmin([np.hypot(*(cen[z] - centre(g))) for g in groups]))
-        groups[r].append(z)
+            seed = max(unassigned, key=lambda z: kg[z])
+            unassigned.discard(seed)
+            grp, total = [seed], kg[seed]
+            while total < target * (1 - KG_TOLERANCE):
+                fits = [z for z in unassigned if total + kg[z] <= target * (1 + KG_TOLERANCE)]
+                if not fits:
+                    break
+                gc = centre(grp)
+                pick = min(fits, key=lambda z: np.hypot(*(cen[z] - gc)))
+                grp.append(pick)
+                total += kg[pick]
+                unassigned.discard(pick)
+            groups.append(grp)
+        for z in unassigned:                      # leftovers join the nearest group
+            r = int(np.argmin([np.hypot(*(cen[z] - centre(g))) for g in groups]))
+            groups[r].append(z)
 
-    # 2. Split any group whose loop is over the cap (letter zones are not split)
-    def split_to_cap(zs):
-        if cap_km is None or len(zs) < 2 or route_km(zs) <= cap_km:
-            if cap_km is not None and len(zs) == 1 and route_km(zs) > cap_km:
-                print(f"  Letter {zs[0]} alone is over the route cap")
-            return [zs]
-        pts = np.array([cen[z] for z in zs])
-        ws = np.array([kg[z] for z in zs])
-        km = KMeans(n_clusters=2, n_init=10, random_state=0).fit(pts, sample_weight=ws)
-        a = [z for z, l in zip(zs, km.labels_) if l == 0]
-        b = [z for z, l in zip(zs, km.labels_) if l == 1]
-        if not a or not b:
-            return [zs]
-        return split_to_cap(a) + split_to_cap(b)
+        # 2. Split any group whose loop is over the cap (letter zones are not split)
+        def split_to_cap(zs):
+            if cap_km is None or len(zs) < 2 or route_km(zs) <= cap_km:
+                if cap_km is not None and len(zs) == 1 and route_km(zs) > cap_km:
+                    print(f"  Letter {zs[0]} alone is over the route cap")
+                return [zs]
+            pts = np.array([cen[z] for z in zs])
+            ws = np.array([kg[z] for z in zs])
+            km = KMeans(n_clusters=2, n_init=10, random_state=0).fit(pts, sample_weight=ws)
+            a = [z for z, l in zip(zs, km.labels_) if l == 0]
+            b = [z for z, l in zip(zs, km.labels_) if l == 1]
+            if not a or not b:
+                return [zs]
+            return split_to_cap(a) + split_to_cap(b)
 
-    groups = [part for g in groups for part in split_to_cap(g)]
-    gk = [sum(kg[z] for z in g) for g in groups]
-    print(f"  {len(groups)} groups, kg {min(gk):,.0f} to {max(gk):,.0f}")
+        groups = [part for g in groups for part in split_to_cap(g)]
+        gk = [sum(kg[z] for z in g) for g in groups]
+        print(f"  {len(groups)} groups, kg {min(gk):,.0f} to {max(gk):,.0f}")
 
     # 3. Zero-weight letters join the nearest group centre
     centres = np.array([centre(g) for g in groups])
