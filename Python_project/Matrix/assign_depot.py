@@ -8,7 +8,8 @@ Two methods (settings.toml [assignment] method):
      at least TOLERANCE_KM nearer than the next-nearest. Areas not clearly nearer to any depot
      are left unassigned, not forced.
   3. Max distance: an area further than MAX_KM from its nearest depot is flagged, not assigned.
-  4. Fill by capacity: each depot takes its eligible areas largest margin first, and stops
+  4. Fill by capacity: each depot takes its eligible areas largest margin first (or, for a depot
+     in FILL_FURTHEST_FROM, furthest from the depot it names first), and stops
      when the next area would take it over its kg or pallets per day. Capacity is the depot's
      [fleet] in settings.toml, by vehicle type, times the [vehicles] kg and pallets.
   5. Route-km check: before each addition, the closed loop depot -> area -> depot (routing.vehicle_route)
@@ -64,6 +65,7 @@ VEHICLE_TYPES = SETTINGS["vehicles"]
 FALLBACK_TO_NEAREST = S.get("fallback_to_nearest", True)   # leftovers go to their nearest depot, flagged
 MAX_KG_PER_WEEK = dict(S.get("max_kg_per_week", {}))        # depot -> kg-per-week target (fill and fallback respect it)
 OVER_TARGET = S.get("over_target", "next")                  # area over a depot's target: "next" depot or "pallet" network
+FILL_FURTHEST_FROM = dict(S.get("fill_furthest_from", {}))  # depot -> other depot: fill areas furthest from it first
 PALLET_COL = S.get("pallet_col", "").strip()  # pallets column in the orders file ("" = no pallet check)
 
 # Orders file columns (same as Matrix/build_matrix.py)
@@ -235,6 +237,19 @@ def load_area_volume(path, areas):
     return vol, has_pal
 
 
+def fill_key(t, dist, names):
+    """Fill order within each depot, largest first: margin over the next-nearest depot, or for a
+    depot in FILL_FURTHEST_FROM, the distance from the depot it names."""
+    key = t["Margin km"].to_numpy(dtype=float).copy()
+    for depot, other in FILL_FURTHEST_FROM.items():
+        if depot not in names or other not in names:
+            print(f"Note: fill_furthest_from {depot} -> {other} ignored (not an active depot)")
+            continue
+        mask = (t["Nearest depot"] == depot).to_numpy()
+        key[mask] = dist[mask, names.index(other)]
+    return key
+
+
 def distance_stage(helper, depot_xy, volume, check_pallets=True):
     """Assignment table (one row per area) and leftovers list. See the module docstring for the rules."""
     from routing import vehicle_route    # imported here so the "nearest" method does not need it
@@ -279,7 +294,10 @@ def distance_stage(helper, depot_xy, volume, check_pallets=True):
     load = {d: [0.0, 0.0] for d in names}
     full = set()
     # Rule 4: per depot, largest margin first. Each area is eligible for one depot only (its nearest).
-    eligible = t[t["Reason"] == ""].sort_values(["Nearest depot", "Margin km", AREA],
+    # A depot in FILL_FURTHEST_FROM fills furthest from the named depot first instead (e.g. Bristol
+    # furthest from Watford), so the areas it cuts at its target are the ones nearest that depot.
+    t["_order"] = fill_key(t, dist, names)
+    eligible = t[t["Reason"] == ""].sort_values(["Nearest depot", "_order", AREA],
                                                 ascending=[True, False, True])
     for i, r in eligible.iterrows():
         d = r["Nearest depot"]
@@ -309,26 +327,29 @@ def distance_stage(helper, depot_xy, volume, check_pallets=True):
     if FALLBACK_TO_NEAREST:
         # A depot with a kg target (MAX_KG_PER_WEEK) takes fallback areas only while it stays within it.
         # Fleet capacity is not checked here: the planning estimate decides what fits on vehicles.
-        fb = t[(t["Reason"] != "") & (t["Reason"] != R_NO_GRID)].sort_values(["Margin km", AREA],
+        fb = t[(t["Reason"] != "") & (t["Reason"] != R_NO_GRID)].sort_values(["_order", AREA],
                                                                              ascending=[False, True])
         for i, r in fb.iterrows():
             kg, why = r["kg per day"], r["Reason"].lower()
             choice, flag = None, None
             for rank, k in enumerate(order[i]):
                 d = names[k]
-                if d in target and load[d][0] + fallback_load[d][0] + kg > target[d]:
+                # The fill stopped at this depot (full): do not top it up with a later, smaller area,
+                # or the fill order (e.g. Bristol furthest from Watford first) would be undone.
+                full_here = rank == 0 and r["Reason"] == R_CAPACITY
+                if full_here or (d in target and load[d][0] + fallback_load[d][0] + kg > target[d]):
                     if OVER_TARGET == "pallet":
-                        flag = f"Over {d} target: pallet network ({why})"
+                        flag = f"{d} full: pallet network ({why})"
                         break
                     continue                          # "next": try the next-nearest depot
                 if rank > 0 and (dist[i, k] > MAX_KM or 2 * dist[i, k] > route_cap(d)):
-                    flag = f"Over {names[order[i][0]]} target, next depot too far: pallet network ({why})"
+                    flag = f"{names[order[i][0]]} full, next depot too far: pallet network ({why})"
                     break                             # never move an area to a far depot just to cut a target
                 choice = d
                 flag = (f"Fallback ({why}): may need pallet network" if rank == 0 else
-                        f"Over {names[order[i][0]]} target: moved to {d} ({why})")
+                        f"{names[order[i][0]]} full: moved to {d} ({why})")
                 break
-            t.at[i, "Flag"] = flag or "Over every depot target: pallet network"
+            t.at[i, "Flag"] = flag or "Every depot full: pallet network"
             if choice:
                 t.at[i, DEPOT] = choice
                 t.at[i, "Km to chosen"] = round(float(dist[i, names.index(choice)]), 1)
@@ -336,6 +357,7 @@ def distance_stage(helper, depot_xy, volume, check_pallets=True):
                 fallback_load[choice][1] += r["Pallets per day"]
     t.loc[t["Reason"] == R_NO_GRID, "Flag"] = "No depot: no grid reference"
 
+    t = t.drop(columns="_order")
     t["Changed"] = t[DEPOT] != t["Current depot"]
     leftovers = t[t["Reason"] != ""].copy()
     loads = pd.DataFrame([{
@@ -366,8 +388,8 @@ def check_assignment(t, depot_xy):
              "Result": "Pass" if bad_tol.empty else "FAIL",
              "Detail": ", ".join(bad_tol[AREA]) or f"{len(a)} areas assigned"}]
     fb = t[t["Reason"] != ""]
-    bad_fb = fb[(fb[DEPOT] != "") & (fb[DEPOT] != fb["Nearest depot"]) & ~fb["Flag"].str.startswith("Over ")]
-    rows.append({"Check": "Fallback areas go to their nearest depot (unless it is at its kg target)",
+    bad_fb = fb[(fb[DEPOT] != "") & (fb[DEPOT] != fb["Nearest depot"]) & ~fb["Flag"].str.contains(" full: moved to ")]
+    rows.append({"Check": "Fallback areas go to their nearest depot (unless it is full)",
                  "Result": "Pass" if bad_fb.empty else "FAIL",
                  "Detail": ", ".join(bad_fb[AREA]) or f"{int((fb[DEPOT] != '').sum())} fallback areas"})
     if {"Watford", "Bristol Outbase"} <= set(depot_xy):
@@ -376,14 +398,14 @@ def check_assignment(t, depot_xy):
         # Bristol side of the perpendicular bisector of Watford-Bristol: nearer Bristol than Watford
         pts = at_w[["_E", "_N"]].to_numpy(dtype=float)
         bristol_side = np.hypot(*(pts - b).T) < np.hypot(*(pts - w).T)
-        moved = at_w["Flag"].str.startswith("Over ").to_numpy()
+        moved = at_w["Flag"].str.contains(" full: moved to ").to_numpy()
         bad = at_w.loc[bristol_side & ~moved, AREA]
         rows.append({"Check": "No Watford area on the Bristol side of the Watford-Bristol midpoint "
-                              "(areas moved past a full Bristol target excepted, they are flagged)",
+                              "(areas moved past a full Bristol excepted, they are flagged)",
                      "Result": "Pass" if bad.empty else "FAIL", "Detail": ", ".join(bad) or ""})
         crossed = at_w.loc[bristol_side & moved, AREA]
         if len(crossed):
-            rows.append({"Check": "Bristol-side areas moved to Watford because Bristol is at its target",
+            rows.append({"Check": "Bristol-side areas moved to Watford because Bristol is full",
                          "Result": "Flagged", "Detail": ", ".join(crossed)})
     left = t[t[DEPOT] == ""]
     unflagged = left[left["Flag"] == ""]

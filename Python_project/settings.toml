@@ -149,6 +149,11 @@ preferred_bonus_km = 15
 [assignment.max_kg_per_week]
 # "Bristol Outbase" = 40000
 
+# Fill order: a depot listed here takes its areas furthest from the named depot first, instead of
+# largest margin first. With a Bristol target, the areas Bristol cuts are then the ones nearest Watford.
+[assignment.fill_furthest_from]
+"Bristol Outbase" = "Watford"
+
 # Per-depot route cap set by hand, in km. Overrides the cap from the orders file (still never above
 # max_route_km). A depot left out uses the cap from the orders, or max_route_km.
 [assignment.route_cap_km]
