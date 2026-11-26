@@ -5,10 +5,10 @@ vehicle route is a closed loop: depot -> stops -> depot. Straight-line distance
 understates road distance, and by different amounts in rural and urban areas,
 so the totals are for comparing options, not for mileage.
 
-Depot positions: the matrix has no depot grid references. Unless a depot is
-set in DEPOT_GRID_KM below, its position is the kg-weighted centre of the
-areas it serves. That is a proxy, and it moves the legs if the real depot
-sits away from its areas. Fill in DEPOT_GRID_KM with real refs when available.
+Depot positions: the real site from the depot info file (DEPOT_INFO_PATH in
+.env, the same file Matrix/assign_depot.py uses). A depot set in DEPOT_GRID_KM
+below overrides it. Only a depot missing from both falls back to the kg-weighted
+centre of the areas it serves, which is a proxy, and the run says so.
 
 Used by planning_estimate.py and the quality sweep. The anneal does not use it.
 """
@@ -39,8 +39,8 @@ def load_grid_refs():
     """One matrix load. Returns (area_coords, depot_coords), both in km.
 
     area_coords: area -> (x, y), averaged over matrix rows with grid references.
-    depot_coords: depot -> (x, y), kg-weighted centre of its areas unless set
-    in DEPOT_GRID_KM.
+    depot_coords: depot -> (x, y): DEPOT_GRID_KM, else the depot info file, else
+    the kg-weighted centre of its areas (printed, as it is only a proxy).
     """
     m = load_matrix(select_matrix_path())
     m = m[(m[EAST] > 0) & (m[NORTH] > 0)]
@@ -48,21 +48,18 @@ def load_grid_refs():
     c = m.groupby(AREA)[[EAST, NORTH]].mean() / 1000
     area_coords = {a: (x, y) for a, x, y in zip(c.index, c[EAST], c[NORTH])}
 
-    depot_coords = {}
+    real = {**depot_info_km(), **DEPOT_GRID_KM}
+    depot_coords = dict(real)
     for name, g in m.groupby(DEPOT):
+        if name in real:
+            continue
         w = g[WEIGHT].to_numpy(dtype=float)
         if w.sum() > 0:
             x, y = np.average(g[EAST], weights=w), np.average(g[NORTH], weights=w)
         else:
             x, y = g[EAST].mean(), g[NORTH].mean()
         depot_coords[name] = (x / 1000, y / 1000)
-    # Depots with no areas in this matrix (e.g. a closing depot after reassignment) still
-    # need a position for their "before" routes: take it from the depot info file.
-    for name, xy in depot_info_km().items():
-        if name not in depot_coords:
-            depot_coords[name] = xy
-            print(f"{name}: not in the matrix, position from the depot info file")
-    depot_coords.update(DEPOT_GRID_KM)
+        print(f"{name}: no position in the depot info file, using the weighted centre of its areas")
     return area_coords, depot_coords
 
 
