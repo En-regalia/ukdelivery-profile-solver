@@ -13,9 +13,13 @@ Two methods (settings.toml [assignment] method):
      [fleet] in settings.toml, by vehicle type, times the [vehicles] kg and pallets.
   5. Route-km check: before each addition, the closed loop depot -> area -> depot (routing.vehicle_route)
      must fit within the depot's route cap. An area that breaks it is skipped.
-  6. Areas no depot can take go to a leftovers list with the reason. In the assigned helper file
-     their depot is "Leftover", so the anneal does not plan them and the planning estimate sends
-     their orders to the pallet network, where they stay visible. They are never forced onto a depot.
+  6. Fallback (FALLBACK_TO_NEAREST, default on): every area rules 2 to 5 could not place goes to
+     its nearest depot anyway, flagged with the reason ("may need pallet network"), so no postcode
+     is left uncovered. The anneal and the planning estimate then decide: the anneal treats far
+     letters as external (pallet network), and the planning estimate's route cap and fleet checks
+     list any orders that still do not fit. The flagged areas are on the "Flagged" sheet.
+     With the fallback off, these areas get the depot "Leftover" and go to the pallet network.
+     Only an area with no grid reference stays "Leftover" either way.
 
 "nearest": the old method. Nearest active depot, with a bonus for the current depot, and
   locked depots that keep their own areas and take on no others.
@@ -56,6 +60,7 @@ ROUTE_CAPS_FROM_ORDERS = S.get("route_caps_from_orders", True)   # per-depot cap
 ROUTE_CAP_KM = dict(S.get("route_cap_km", {}))   # per-depot cap set by hand: overrides the one from the orders
 # Capacity per depot per day comes from settings.toml: [fleet] (vehicles by type) x [vehicles] (kg, pallets)
 VEHICLE_TYPES = SETTINGS["vehicles"]
+FALLBACK_TO_NEAREST = S.get("fallback_to_nearest", True)   # leftovers go to their nearest depot, flagged
 PALLET_COL = S.get("pallet_col", "").strip()  # pallets column in the orders file ("" = no pallet check)
 
 # Orders file columns (same as Matrix/build_matrix.py)
@@ -73,7 +78,7 @@ PREFERRED_BONUS_KM = S["preferred_bonus_km"]  # current depot treated as this ma
 ACTIVE_DEPOTS = [d for d in _ACTIVE if d not in CLOSING_DEPOTS]
 locked = set(LOCKED_DEPOTS)   # "nearest" method only: depots that keep their current areas and take no others
 
-LEFTOVER = "Leftover"            # depot name given to leftovers in the assigned helper file
+LEFTOVER = "Leftover"            # depot name for areas with no depot in the assigned helper file
 
 # Leftover reasons
 R_TOO_FAR = "Too far"            # nearest depot beyond MAX_KM
@@ -291,6 +296,19 @@ def distance_stage(helper, depot_xy, volume, check_pallets=True):
         t.at[i, DEPOT] = d
         t.at[i, "Km to chosen"] = r["Km to nearest"]
 
+    # Rule 6: fallback to the nearest depot, flagged. Capacity is not checked here on purpose:
+    # the planning estimate's fleet and route-cap checks decide what actually fits.
+    t["Flag"] = ""
+    fallback_load = {d: [0.0, 0.0] for d in names}
+    if FALLBACK_TO_NEAREST:
+        fb = (t["Reason"] != "") & (t["Reason"] != R_NO_GRID)
+        t.loc[fb, DEPOT] = t.loc[fb, "Nearest depot"]
+        t.loc[fb, "Km to chosen"] = t.loc[fb, "Km to nearest"]
+        t.loc[fb, "Flag"] = "Fallback (" + t.loc[fb, "Reason"].str.lower() + "): may need pallet network"
+        for d, g in t[fb].groupby(DEPOT):
+            fallback_load[d] = [g["kg per day"].sum(), g["Pallets per day"].sum()]
+    t.loc[t["Reason"] == R_NO_GRID, "Flag"] = "No depot: no grid reference"
+
     t["Changed"] = t[DEPOT] != t["Current depot"]
     leftovers = t[t["Reason"] != ""].copy()
     loads = pd.DataFrame([{
@@ -303,17 +321,27 @@ def distance_stage(helper, depot_xy, volume, check_pallets=True):
         "Full": "Yes" if d in full else "",
         "Leftovers (over capacity)": int(((t["Nearest depot"] == d) & (t["Reason"] == R_CAPACITY)).sum()),
         "Leftovers (route km)": int(((t["Nearest depot"] == d) & (t["Reason"] == R_ROUTE)).sum()),
+        "Fallback areas": int(((t[DEPOT] == d) & (t["Reason"] != "")).sum()),
+        "Fallback kg per day": round(fallback_load[d][0], 0),
+        "kg per day incl. fallback": round(load[d][0] + fallback_load[d][0], 0),
+        "kg used incl. fallback": round((load[d][0] + fallback_load[d][0]) / cap[d][1], 3) if cap[d][1] else None,
     } for d in names])
     return t, leftovers, loads
 
 
 def check_assignment(t, depot_xy):
     """Acceptance checks. Returns rows of (check, result, detail)."""
-    a = t[t[DEPOT] != ""]
+    a = t[(t[DEPOT] != "") & (t["Reason"] == "")]          # placed by rules 2 to 5 (not fallback)
     bad_tol = a[(a[DEPOT] != a["Nearest depot"]) | (a["Margin km"] < TOLERANCE_KM)]
-    rows = [{"Check": f"Assigned only to the nearest depot, at least {TOLERANCE_KM} km nearer than the next",
+    rows = [{"Check": f"Assigned only to the nearest depot, at least {TOLERANCE_KM} km nearer than the next "
+                      "(fallback areas excepted, they are flagged)",
              "Result": "Pass" if bad_tol.empty else "FAIL",
              "Detail": ", ".join(bad_tol[AREA]) or f"{len(a)} areas assigned"}]
+    fb = t[t["Reason"] != ""]
+    bad_fb = fb[(fb[DEPOT] != "") & (fb[DEPOT] != fb["Nearest depot"])]
+    rows.append({"Check": "Fallback areas go to their nearest depot",
+                 "Result": "Pass" if bad_fb.empty else "FAIL",
+                 "Detail": ", ".join(bad_fb[AREA]) or f"{int((fb[DEPOT] != '').sum())} fallback areas"})
     if {"Watford", "Bristol Outbase"} <= set(depot_xy):
         w, b = (np.array(depot_xy[d], dtype=float) for d in ("Watford", "Bristol Outbase"))
         at_w = t[t[DEPOT] == "Watford"]
@@ -324,10 +352,13 @@ def check_assignment(t, depot_xy):
         rows.append({"Check": "No Watford area on the Bristol side of the Watford-Bristol midpoint",
                      "Result": "Pass" if bad.empty else "FAIL", "Detail": ", ".join(bad) or ""})
     left = t[t[DEPOT] == ""]
-    no_reason = left[left["Reason"] == ""]
-    rows.append({"Check": "Every area without a depot is on the leftovers list with a reason",
+    rows.append({"Check": "Every postcode area has a depot",
+                 "Result": "Pass" if left.empty else "FAIL",
+                 "Detail": ", ".join(f"{a} ({r})" for a, r in zip(left[AREA], left["Reason"]))})
+    no_reason = t[(t["Flag"] != "") & (t["Reason"] == "")]
+    rows.append({"Check": "Every flagged area has a reason",
                  "Result": "Pass" if no_reason.empty else "FAIL",
-                 "Detail": ", ".join(no_reason[AREA]) or f"{len(left)} leftovers"})
+                 "Detail": ", ".join(no_reason[AREA]) or f"{int((t['Flag'] != '').sum())} flagged"})
     return pd.DataFrame(rows)
 
 
@@ -358,35 +389,36 @@ def run_distance_stage(helper, depot_xy):
 
     print("\nDepot loads (capacity per day from [fleet] x [vehicles] in settings.toml)")
     print(loads.to_string(index=False))
-    print(f"\nLeftovers: {len(leftovers)}")
+    print(f"\nFlagged (rules 2 to 5 could not place them): {len(leftovers)}"
+          + ("  ->  given to their nearest depot" if FALLBACK_TO_NEAREST else "  ->  depot 'Leftover'"))
     if not leftovers.empty:
         print(leftovers.groupby("Reason").size().to_string())
-        print(leftovers[[AREA, "Current depot", "Nearest depot", "Km to nearest", "Next depot",
+        print(leftovers[[AREA, "Current depot", DEPOT, "Km to nearest", "Next depot",
                          "Margin km", "kg per day", "Reason"]].to_string(index=False))
     print("\nChecks")
     print(checks.to_string(index=False))
 
     cols = [AREA, "Current depot", DEPOT, "Km to chosen", "Nearest depot", "Km to nearest", "Next depot",
-            "Km to next", "Margin km", "Loop km", "kg per day", "Pallets per day", "Changed", "Reason"]
+            "Km to next", "Margin km", "Loop km", "kg per day", "Pallets per day", "Changed", "Reason", "Flag"]
     out = DEPOT_OUT.parent / f"Depot_assignment_{RUN_STAMP}.xlsx"
     out.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(out) as xl:
         t[cols].rename(columns={DEPOT: "Assigned depot"}).to_excel(xl, sheet_name="Assignment", index=False)
-        leftovers[[c for c in cols if c not in (DEPOT, "Km to chosen")]].to_excel(xl, sheet_name="Leftovers", index=False)
+        leftovers[cols].rename(columns={DEPOT: "Assigned depot"}).to_excel(xl, sheet_name="Flagged", index=False)
         loads.to_excel(xl, sheet_name="Depot loads", index=False)
         checks.to_excel(xl, sheet_name="Checks", index=False)
         settings_rows(depot_xy, has_pal).to_excel(xl, sheet_name="Settings", index=False)
     print(f"Saved: {out}")
 
-    # Helper file for build_matrix: same columns as the input, depot replaced. Leftovers get the
-    # depot name LEFTOVER, which is not active, so the anneal does not plan them and the planning
-    # estimate sends their orders to the pallet network, where they stay visible.
+    # Helper file for build_matrix: same columns as the input, depot replaced. Areas with no depot
+    # (fallback off, or no grid reference) get LEFTOVER, which is not active, so the anneal does not
+    # plan them and the planning estimate sends their orders to the pallet network.
     result = helper.copy()
     result["Current depot"] = helper[DEPOT]
     result[DEPOT] = t[DEPOT].replace("", LEFTOVER).to_numpy()
     result["Km to depot"] = t["Km to chosen"].to_numpy()
     result["Changed"] = t["Changed"].to_numpy()
-    result["Review"] = t["Reason"].to_numpy()
+    result["Review"] = t["Flag"].to_numpy()
     return result
 
 
