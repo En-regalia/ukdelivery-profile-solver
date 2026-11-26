@@ -270,7 +270,7 @@ def load_plan(source):
         status = outl["Status"].str.strip()
         pallet_areas = set(outl.loc[status.str.match(r"(External|Excluded)"), AREA].str.strip())
         plans[depot] = (new, pallet_areas)
-        print(f"Plan: {depot} ({f.name}) - {len(new)} areas with days, "
+        print(f"Plan: {depot} - {len(new)} areas with days, "
               f"{len(pallet_areas)} pallet-network areas")
     return plans
 
@@ -868,9 +868,6 @@ def simulate(label, wk, wo, plans, coords, depot_xy):
                                         "Reason": r["Reason"], "KG": round(r["kg"]),
                                         "Pallets": round(r["pal"], 1)})
 
-        for plan_name, parts in limits.items():
-            print(f"{label} {depot} {plan_name}: added km limit {', '.join(parts)}")
-
         out["Checks"].append({"Week": label, "Week ID": wk, "Depot": depot,
                               "Simulated KG": round(own["kg"].sum()),
                               "Moved out KG": round(moved_out_total),
@@ -1290,19 +1287,22 @@ def main():
 
     example_routes = pick_example_routes(planned_vehicles)
     if example_routes:
+        example_dir = OUTPUT_DIR / f"Run_{RUN_STAMP}" / "Example_maps"
+        example_dir.mkdir(parents=True, exist_ok=True)
         outline = load_uk_outline()
         for kind, v in example_routes:
             name = (f"{v['Depot']}_{v['Day']}_week_{v['Week']}_{v['Type']}_vehicle_{v['Vehicle']}_{kind}.png")
-            png = draw_route_map(kind, v, coords, depot_xy, outline, run_dir / safe_name(name),
+            png = draw_route_map(kind, v, coords, depot_xy, outline, example_dir / safe_name(name),
                                  matching_actual_routes(v, actual))
-            if png:
-                print(f"Saved {png}")
+        print(f"Days Maps Saved {png}")
 
         if DAY_MAPS:
             # every weekday, for each depot and week that has an example route
             day_dir = run_dir / "Day maps"
             day_dir.mkdir(exist_ok=True)
             for depot, week in sorted({(v["Depot"], v["Week"]) for _, v in example_routes}):
+                day_dir_depot = run_dir / "Day maps"
+                day_dir_depot.mkdir(exist_ok=True)
                 for day in DAYS:
                     planned = [v for v in planned_vehicles
                                if (v["Depot"], v["Day"], v["Week"]) == (depot, day, week)]
@@ -1311,7 +1311,7 @@ def main():
                     act = [r for r in actual if (r["Depot"], r["Day"], r["Week"]) == (depot, day, week)]
                     png = draw_day_map(depot, day, week, planned, act, coords, depot_xy, outline,
                                        day_dir / safe_name(f"{depot}_{DAYS.index(day) + 1}_{day}_week_{week}.png"))
-                    print(f"Saved {png}")
+            print(f"Day maps Saved to: {day_dir}")
 
     out = run_dir / f"Example_weeks_{RUN_STAMP}.xlsx"
     with pd.ExcelWriter(out) as xl:

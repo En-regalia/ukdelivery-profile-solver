@@ -27,15 +27,16 @@ def step(title, fn):
 
 
 if ask_skip(5):
-    print("Step 1: Depot assignment Skipped. Using existing/actual postcode areas")
+    print("Depot assignment/Anneal Skipped.")
 else:
     step("1. Depot assignment", Matrix.assign_depot.main)
+    step("2. Build matrix", Matrix.build_matrix.main)
 
-step("2. Build matrix", Matrix.build_matrix.main)
-if not matrix_common.MATRIX_PATH.exists():
-    raise SystemExit(f"Matrix not found: {matrix_common.MATRIX_PATH}")
-print(f"\nUsing matrix for all steps: {matrix_common.MATRIX_PATH}")
+    if not matrix_common.MATRIX_PATH.exists():
+        raise SystemExit(f"Matrix not found: {matrix_common.MATRIX_PATH}")
+    print(f"\nUsing matrix for all steps: {matrix_common.MATRIX_PATH}")
 
-step("3. Anneal", anneal_regional.main)
+    step("3. Anneal", anneal_regional.main)
+
 step("4. Sweep", sweep_plan.main)
 step("5. Planning estimate", planning_estimate.main)

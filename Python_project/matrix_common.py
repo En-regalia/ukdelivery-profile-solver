@@ -215,7 +215,7 @@ def closed_tour_km(pts, starts=20):
 
 def ask_skip(seconds=5, key="s"):
     """True if the key is pressed within `seconds`; False if the time runs out."""
-    print(f"Press S to skip step 1 (depot assignment). "
+    print(f"Press S to skip depot assignment & postcode assignment. Run only planning estimates"
           f"It runs in {seconds} seconds if nothing is pressed.", flush=True)
     try:
         import msvcrt                      # Windows

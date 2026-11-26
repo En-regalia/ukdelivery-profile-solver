@@ -219,9 +219,9 @@ allocation_spare_pct = 0.90
 # mode = "monthly": enter a figure for each month below. Each sample day gets its month's
 #        figure divided by that month's working days.
 # Leave annual_total at 0 (and the months at 0) to leave cost out of the report.
-mode = "annual"
-annual_total = 0
-budget_year = 2026
+mode = "monthly"
+annual_total =  5903652 
+budget_year = 2027
 currency = "£"
 
 # Share of cost that follows the number of vehicle-days (driver, vehicle hire); the rest
@@ -234,15 +234,16 @@ bank_holidays = ["2026-01-01", "2026-04-03", "2026-04-06", "2026-05-04", "2026-0
 
 # Used only when mode = "monthly".
 [cost.monthly]
-Jan = 0
-Feb = 0
-Mar = 0
-Apr = 0
-May = 0
-Jun = 0
-Jul = 0
-Aug = 0
-Sep = 0
-Oct = 0
-Nov = 0
-Dec = 0
+Jan = 490826.59
+Feb = 467825.14
+Mar = 524278.91
+Apr = 483180.38
+May = 513909.81
+Jun = 501089.96
+Jul = 475417.23
+Aug = 482150.62
+Sep = 493428.75
+Oct = 508264.89
+Nov = 488072.37
+Dec = 441633.85
+
