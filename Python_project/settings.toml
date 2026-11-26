@@ -134,12 +134,20 @@ route_caps_from_orders = true   # ...and within each depot's truck cap from its 
 # what fits (far letters become external, orders over the route cap or fleet are listed).
 # false: those areas get the depot "Leftover" and all their orders go to the pallet network.
 fallback_to_nearest = true
+# What happens to an area whose nearest depot is at its kg target ([assignment.max_kg_per_week]):
+# "next" = it goes to the next-nearest depot with room, flagged; "pallet" = pallet network, flagged.
+over_target = "next"
 # Column in the orders file (ORDERS_PATH) with pallets per order. Leave "" if there is none:
 # the pallet limit is then not checked, and the run says so.
 pallet_col = ""
 
 # Old "nearest" method only: the current depot is treated as this many km closer.
 preferred_bonus_km = 15
+
+# kg-per-week target per depot (for example to shrink Bristol). The fill stops at it, and fallback
+# areas over it go to the next depot or the pallet network (over_target). A depot left out has no target.
+[assignment.max_kg_per_week]
+# "Bristol Outbase" = 40000
 
 # Per-depot route cap set by hand, in km. Overrides the cap from the orders file (still never above
 # max_route_km). A depot left out uses the cap from the orders, or max_route_km.

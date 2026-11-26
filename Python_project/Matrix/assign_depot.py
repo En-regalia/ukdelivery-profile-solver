@@ -14,7 +14,8 @@ Two methods (settings.toml [assignment] method):
   5. Route-km check: before each addition, the closed loop depot -> area -> depot (routing.vehicle_route)
      must fit within the depot's route cap. An area that breaks it is skipped.
   6. Fallback (FALLBACK_TO_NEAREST, default on): every area rules 2 to 5 could not place goes to
-     its nearest depot anyway, flagged with the reason ("may need pallet network"), so no postcode
+     its nearest depot anyway (or, if that depot is at its MAX_KG_PER_WEEK target, to the next-nearest
+     depot with room, or the pallet network, per OVER_TARGET), flagged with the reason ("may need pallet network"), so no postcode
      is left uncovered. The anneal and the planning estimate then decide: the anneal treats far
      letters as external (pallet network), and the planning estimate's route cap and fleet checks
      list any orders that still do not fit. The flagged areas are on the "Flagged" sheet.
@@ -61,6 +62,8 @@ ROUTE_CAP_KM = dict(S.get("route_cap_km", {}))   # per-depot cap set by hand: ov
 # Capacity per depot per day comes from settings.toml: [fleet] (vehicles by type) x [vehicles] (kg, pallets)
 VEHICLE_TYPES = SETTINGS["vehicles"]
 FALLBACK_TO_NEAREST = S.get("fallback_to_nearest", True)   # leftovers go to their nearest depot, flagged
+MAX_KG_PER_WEEK = dict(S.get("max_kg_per_week", {}))        # depot -> kg-per-week target (fill and fallback respect it)
+OVER_TARGET = S.get("over_target", "next")                  # area over a depot's target: "next" depot or "pallet" network
 PALLET_COL = S.get("pallet_col", "").strip()  # pallets column in the orders file ("" = no pallet check)
 
 # Orders file columns (same as Matrix/build_matrix.py)
@@ -270,6 +273,9 @@ def distance_stage(helper, depot_xy, volume, check_pallets=True):
     t.loc[(t["Reason"] == "") & (d2 - d1 < TOLERANCE_KM), "Reason"] = R_UNASSIGNED
 
     cap = depot_capacity(names)
+    target = {d: MAX_KG_PER_WEEK[d] / 5 for d in names if d in MAX_KG_PER_WEEK}   # kg per day
+    for d, kg_day in target.items():                 # the fill stops at the target as well as the fleet
+        cap[d] = (cap[d][0], min(cap[d][1], kg_day), cap[d][2])
     load = {d: [0.0, 0.0] for d in names}
     full = set()
     # Rule 4: per depot, largest margin first. Each area is eligible for one depot only (its nearest).
@@ -301,18 +307,40 @@ def distance_stage(helper, depot_xy, volume, check_pallets=True):
     t["Flag"] = ""
     fallback_load = {d: [0.0, 0.0] for d in names}
     if FALLBACK_TO_NEAREST:
-        fb = (t["Reason"] != "") & (t["Reason"] != R_NO_GRID)
-        t.loc[fb, DEPOT] = t.loc[fb, "Nearest depot"]
-        t.loc[fb, "Km to chosen"] = t.loc[fb, "Km to nearest"]
-        t.loc[fb, "Flag"] = "Fallback (" + t.loc[fb, "Reason"].str.lower() + "): may need pallet network"
-        for d, g in t[fb].groupby(DEPOT):
-            fallback_load[d] = [g["kg per day"].sum(), g["Pallets per day"].sum()]
+        # A depot with a kg target (MAX_KG_PER_WEEK) takes fallback areas only while it stays within it.
+        # Fleet capacity is not checked here: the planning estimate decides what fits on vehicles.
+        fb = t[(t["Reason"] != "") & (t["Reason"] != R_NO_GRID)].sort_values(["Margin km", AREA],
+                                                                             ascending=[False, True])
+        for i, r in fb.iterrows():
+            kg, why = r["kg per day"], r["Reason"].lower()
+            choice, flag = None, None
+            for rank, k in enumerate(order[i]):
+                d = names[k]
+                if d in target and load[d][0] + fallback_load[d][0] + kg > target[d]:
+                    if OVER_TARGET == "pallet":
+                        flag = f"Over {d} target: pallet network ({why})"
+                        break
+                    continue                          # "next": try the next-nearest depot
+                if rank > 0 and (dist[i, k] > MAX_KM or 2 * dist[i, k] > route_cap(d)):
+                    flag = f"Over {names[order[i][0]]} target, next depot too far: pallet network ({why})"
+                    break                             # never move an area to a far depot just to cut a target
+                choice = d
+                flag = (f"Fallback ({why}): may need pallet network" if rank == 0 else
+                        f"Over {names[order[i][0]]} target: moved to {d} ({why})")
+                break
+            t.at[i, "Flag"] = flag or "Over every depot target: pallet network"
+            if choice:
+                t.at[i, DEPOT] = choice
+                t.at[i, "Km to chosen"] = round(float(dist[i, names.index(choice)]), 1)
+                fallback_load[choice][0] += kg
+                fallback_load[choice][1] += r["Pallets per day"]
     t.loc[t["Reason"] == R_NO_GRID, "Flag"] = "No depot: no grid reference"
 
     t["Changed"] = t[DEPOT] != t["Current depot"]
     leftovers = t[t["Reason"] != ""].copy()
     loads = pd.DataFrame([{
         "Depot": d, "Vehicles": cap[d][0], "Route cap km": route_cap(d),
+        "kg target per week": MAX_KG_PER_WEEK.get(d),
         "Areas": int((t[DEPOT] == d).sum()),
         "kg per day": round(load[d][0], 0), "kg cap": cap[d][1],
         "kg used": round(load[d][0] / cap[d][1], 3) if cap[d][1] else None,
@@ -338,8 +366,8 @@ def check_assignment(t, depot_xy):
              "Result": "Pass" if bad_tol.empty else "FAIL",
              "Detail": ", ".join(bad_tol[AREA]) or f"{len(a)} areas assigned"}]
     fb = t[t["Reason"] != ""]
-    bad_fb = fb[(fb[DEPOT] != "") & (fb[DEPOT] != fb["Nearest depot"])]
-    rows.append({"Check": "Fallback areas go to their nearest depot",
+    bad_fb = fb[(fb[DEPOT] != "") & (fb[DEPOT] != fb["Nearest depot"]) & ~fb["Flag"].str.startswith("Over ")]
+    rows.append({"Check": "Fallback areas go to their nearest depot (unless it is at its kg target)",
                  "Result": "Pass" if bad_fb.empty else "FAIL",
                  "Detail": ", ".join(bad_fb[AREA]) or f"{int((fb[DEPOT] != '').sum())} fallback areas"})
     if {"Watford", "Bristol Outbase"} <= set(depot_xy):
@@ -348,13 +376,21 @@ def check_assignment(t, depot_xy):
         # Bristol side of the perpendicular bisector of Watford-Bristol: nearer Bristol than Watford
         pts = at_w[["_E", "_N"]].to_numpy(dtype=float)
         bristol_side = np.hypot(*(pts - b).T) < np.hypot(*(pts - w).T)
-        bad = at_w.loc[bristol_side, AREA]
-        rows.append({"Check": "No Watford area on the Bristol side of the Watford-Bristol midpoint",
+        moved = at_w["Flag"].str.startswith("Over ").to_numpy()
+        bad = at_w.loc[bristol_side & ~moved, AREA]
+        rows.append({"Check": "No Watford area on the Bristol side of the Watford-Bristol midpoint "
+                              "(areas moved past a full Bristol target excepted, they are flagged)",
                      "Result": "Pass" if bad.empty else "FAIL", "Detail": ", ".join(bad) or ""})
+        crossed = at_w.loc[bristol_side & moved, AREA]
+        if len(crossed):
+            rows.append({"Check": "Bristol-side areas moved to Watford because Bristol is at its target",
+                         "Result": "Flagged", "Detail": ", ".join(crossed)})
     left = t[t[DEPOT] == ""]
-    rows.append({"Check": "Every postcode area has a depot",
-                 "Result": "Pass" if left.empty else "FAIL",
-                 "Detail": ", ".join(f"{a} ({r})" for a, r in zip(left[AREA], left["Reason"]))})
+    unflagged = left[left["Flag"] == ""]
+    rows.append({"Check": "Every postcode area has a depot, or is flagged for the pallet network",
+                 "Result": "Pass" if unflagged.empty else "FAIL",
+                 "Detail": ", ".join(unflagged[AREA]) or
+                           (f"pallet network: {', '.join(left[AREA])}" if len(left) else "")})
     no_reason = t[(t["Flag"] != "") & (t["Reason"] == "")]
     rows.append({"Check": "Every flagged area has a reason",
                  "Result": "Pass" if no_reason.empty else "FAIL",
