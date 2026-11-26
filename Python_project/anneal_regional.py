@@ -24,55 +24,53 @@ from maps_common import add_maps_sheet, load_uk_outline, plot_depot_maps
 
 
 # ---- Settings -------------------------------------------------------------
-DEPOT_NAME = None          # a depot name, or None = every depot
+# Values come from settings.toml [anneal] and [depots]; see the notes there.
+from settings import SETTINGS, CLOSING_DEPOTS, is_active
+A = SETTINGS["anneal"]
+DEPOT_NAME = A["depot"].strip() or None    # a depot name, or None = every active depot
 load_dotenv()
 OUTPUT_DIR = Path(os.environ["A_OUTPUT_DIR"])
 RUN_STAMP = datetime.now().strftime("%Y-%m-%d_%H-%M")   # set when the script starts
 
 # Remote letters: weighted centre further than REMOTE_KM from the depot's main
 # body, and fewer than MIN_DISTRICTS weighted districts, are treated as external
-REMOTE_KM = 150.0
-MIN_DISTRICTS = 2
+REMOTE_KM = A["remote_km"]
+MIN_DISTRICTS = A["min_districts"]
 
-GROUP_SIZE = 2             # about this many letter zones per group
-PEAK_TOLERANCE = 0.03      # peak may rise this far above the Letters baseline peak
-PEAK_PENALTY = 500.0       # km added per 100% of peak excess above the limit
-PEAK_COST_KM = 1000.0      # km of day radius a 100% peak reduction is worth (0 = ignore)
+GROUP_SIZE = A["group_size"]
+PEAK_TOLERANCE = A["peak_tolerance"]
+PEAK_PENALTY = A["peak_penalty"]
+PEAK_COST_KM = A["peak_cost_km"]
 
-SPREAD_TOLERANCE = 0.05    # busiest minus quietest day, as a share of the average day
-SPREAD_PENALTY = 1000.0     # km added per 100% of spread excess above the tolerance
+SPREAD_TOLERANCE = A["spread_tolerance"]
+SPREAD_PENALTY = A["spread_penalty"]
 
-SPACING_DAYS_KM = 5.0      # km per unit of uneven spacing between a group's delivery days (0 = ignore)
-SPACING_IDEAL_GAP = 2      # ideal gap in days between consecutive deliveries (every other day)
+SPACING_DAYS_KM = A["spacing_days_km"]
+SPACING_IDEAL_GAP = A["spacing_ideal_gap"]
 
-DAY_LOSS_KM = 10.0         # km cost per day short of a full week, averaged over kg
-MAX_DAY_COUNT = max(len(p) for p in PATTERNS)   # 3 with the current rules set in Planning
+DAY_LOSS_KM = A["day_loss_km"]
+MAX_DAY_COUNT = max(len(p) for p in PATTERNS)   # from [patterns] max_days
 
-ISOLATION_KM = None        # e.g. 10 excludes districts averaging over 10 km to neighbours
-PERCENTILE = 98            # used when ISOLATION_KM is None
+ISOLATION_KM = A["isolation_km"] or None   # 0 in settings = use PERCENTILE
+PERCENTILE = A["percentile"]
 
-MAX_COPY_KM = 15.0         # zero-volume codes further than this get no days
+MAX_COPY_KM = A["max_copy_km"]
 
-ITERATIONS = 200000        # moves per restart
-RESTARTS = 5
-T_START = 10.0             # km: early moves may worsen the cost by about this much
-T_END = 0.05               # km: late moves must almost always improve
-SEED = 0
-AUTO_OPEN = True           # opens the workbook only when a single depot is run
+ITERATIONS = A["iterations"]
+RESTARTS = A["restarts"]
+T_START = A["t_start"]
+T_END = A["t_end"]
+SEED = A["seed"]
+AUTO_OPEN = A["auto_open"]     # full_run.py sets this to False
 
-MAKE_MAPS = True           # day maps come from maps_common.py (shared with the sweep)
+MAKE_MAPS = A["make_maps"]
 
 # ---- Route length cap -----------------------------------------------------
 # Baseline = 95th percentile of planned route lengths per depot (route_baseline.py)
-ROUTE_BASELINE_KM = {
-    "Bristol Outbase": 494.3,
-    "Doncaster": 343.0,
-    "Warrington": 348.1,
-    "Watford": 476.4,
-}
-ROUTE_TOLERANCE = 0.00      # allowance above the baseline: 0.10 = 10% over
-KG_TOLERANCE = 0.10         # a group's kg may differ from the target by this share
-TOUR_STARTS = 20            # starting points tried per route (speed vs accuracy)
+ROUTE_BASELINE_KM = dict(A["route_baseline_km"])
+ROUTE_TOLERANCE = A["route_tolerance"]
+KG_TOLERANCE = A["kg_tolerance"]
+TOUR_STARTS = A["tour_starts"]
 
 from sklearn.neighbors import NearestNeighbors
 
@@ -556,7 +554,17 @@ def main():
     df["Letters"] = df[AREA].str.extract(r"^([A-Z]+)")[0]
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    depots = sorted(df[DEPOT].unique()) if DEPOT_NAME is None else [DEPOT_NAME]
+    in_matrix = sorted(d for d in df[DEPOT].unique() if str(d).strip())
+    skipped = [d for d in in_matrix if not is_active(d)]
+    if skipped:
+        closing = [d for d in skipped if d in CLOSING_DEPOTS]
+        print(f"Not planned (not active in settings.toml): {', '.join(skipped)}")
+        if closing:
+            n = int(df[DEPOT].isin(closing).sum())
+            print(f"WARNING: this matrix still gives {n} areas to closing depots ({', '.join(closing)}). "
+                  "They get no plan and go to the pallet network in the planning estimate. "
+                  "Use the built matrix (after depot assignment) to move them to active depots.")
+    depots = [d for d in in_matrix if is_active(d)] if DEPOT_NAME is None else [DEPOT_NAME]
     print(f"Depots to run: {', '.join(depots)}")
 
     # One dated folder per run

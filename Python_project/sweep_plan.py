@@ -45,19 +45,22 @@ S_OUTPUT_DIR = Path(os.getenv("S_OUTPUT_DIR"))      # sweep output folder (new v
 RUN_STAMP = datetime.now().strftime("%Y-%m-%d_%H-%M")
 
 # ---- Settings ---------------------------------------------------------------------------------------
-SPREAD_VEH = 2            # target: busiest minus quietest day, in vehicles, across the week
-SPREAD_TOL = 0.05         # kg spread tolerance, same as anneal_regional.SPREAD_TOLERANCE
-NEIGHBOURS = 4            # a district may take the pattern of any of its 4 nearest districts
-MAX_PASSES = 20
+# Values come from settings.toml [sweep] and [patterns]; see the notes there.
+from settings import SETTINGS
+SW = SETTINGS["sweep"]
+SPREAD_VEH = SW["spread_veh"]
+SPREAD_TOL = SW["spread_tol"]
+NEIGHBOURS = SETTINGS["patterns"]["neighbours"]
+MAX_PASSES = SW["max_passes"]
 
 # Objective weights: starting points, tune on real weeks
-V_SPREAD = 10.0           # per vehicle of spread, per week
-V_OVER = 100.0            # per vehicle of spread above SPREAD_VEH, per week
-CAP_PEN = 1000.0          # per vehicle above the depot cap, per day
-KG_PEN = 2000.0           # per 100% of kg spread above SPREAD_TOL, per week
-KM_W = 0.001              # per km of proxy, summed over weeks
+V_SPREAD = SW["v_spread"]
+V_OVER = SW["v_over"]
+CAP_PEN = SW["cap_pen"]
+KG_PEN = SW["kg_pen"]
+KM_W = SW["km_w"]
 
-MAKE_MAPS = True          # day maps come from maps_common.py (shared with the anneal)
+MAKE_MAPS = SW["make_maps"]
 
 HGV = PE.VEHICLE_TYPES["HGV"]   # 18t truck: the sweep's vehicle proxy
 # The proxy treats every vehicle as an 8t truck, so the cap is HGV + 26t fleet (vans left out)

@@ -13,8 +13,10 @@ sits away from its areas. Fill in DEPOT_GRID_KM with real refs when available.
 Used by planning_estimate.py and the quality sweep. The anneal does not use it.
 """
 import math
+import os
 
 import numpy as np
+import pandas as pd
 
 from matrix_common import AREA, DEPOT, EAST, NORTH, load_matrix, select_matrix_path
 
@@ -54,8 +56,40 @@ def load_grid_refs():
         else:
             x, y = g[EAST].mean(), g[NORTH].mean()
         depot_coords[name] = (x / 1000, y / 1000)
+    # Depots with no areas in this matrix (e.g. a closing depot after reassignment) still
+    # need a position for their "before" routes: take it from the depot info file.
+    for name, xy in depot_info_km().items():
+        if name not in depot_coords:
+            depot_coords[name] = xy
+            print(f"{name}: not in the matrix, position from the depot info file")
     depot_coords.update(DEPOT_GRID_KM)
     return area_coords, depot_coords
+
+
+def depot_info_km():
+    """Depot -> (x, y) km from the depot info file (DEPOT_INFO_PATH in .env), if it is set.
+
+    Same file and columns as Matrix/assign_depot.py: Title, X (Easting), Y (Northing), metres.
+    """
+    path = (os.getenv("DEPOT_INFO_PATH") or "").strip().strip('"')
+    if not path or not os.path.exists(path):
+        return {}
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            info = pd.read_csv(path, dtype=str, keep_default_na=False, encoding=enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    info.columns = [c.strip() for c in info.columns]
+    out = {}
+    for t, x, y in zip(info["Title"], info["X (Easting)"], info["Y (Northing)"]):
+        try:
+            x, y = float(str(x).replace(",", "")), float(str(y).replace(",", ""))
+        except ValueError:
+            continue
+        if x > 0 and y > 0:
+            out[t.strip()] = (x / 1000, y / 1000)
+    return out
 
 
 def load_area_coords():

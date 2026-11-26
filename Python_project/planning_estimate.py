@@ -77,50 +77,37 @@ RUN_STAMP = datetime.now().strftime("%Y-%m-%d_%H-%M")
 
 # ---- Settings -------------------------------------------------------------
 
-VEHICLE_TYPES = {
-    "HGV": {"kg": 8000, "pallets": 15, "max_km": 400.0},    # 8t truck; route ceiling = the depot's truck cap (see caps_for)
-    "26t": {"kg": 12000, "pallets": 20, "max_km": 400.0},   # 26t truck (an 8t route upgraded); cap = depot truck cap
-    "Van": {"kg": 1000, "pallets": 5, "max_km": 500.0},     # hard route ceiling, straight-line km
-}
-ROUTE_PCT = 0.9           # truck cap: this percentile of the depot's actual HGV route km (never above the HGV max_km)
+# Values come from settings.toml ([vehicles], [routes], [fleet], [planning], [depots]).
+from settings import SETTINGS, TEAM_CODES, fleet_caps
+VEHICLE_TYPES = {t: dict(spec) for t, spec in SETTINGS["vehicles"].items()}
+ROUTE_PCT = SETTINGS["routes"]["route_pct"]   # truck cap: this percentile of the depot's actual HGV route km
 ROUTE_CAP = {}            # depot -> {"HGV": km}; filled in main() from the actual routes (26t uses the same cap)
-FLEET_CAP = {             # vehicles available per depot per day, by type (depot table, Porcelanosa)
-    "Doncaster": {"HGV": 4, "Van": 0, "26t": 0},
-    "Warrington": {"HGV": 6, "Van": 1, "26t": 0},
-    "Watford": {"HGV": 14, "Van": 4, "26t": 2},
-    "Bristol Outbase": {"HGV": 2, "Van": 1, "26t": 0},
-    "Solihull": {"HGV": 3, "Van": 1, "26t": 1},          # depot table shows no vehicles: every Solihull order overflows as "fleet"
-    "Hebburn": {"HGV": 3, "Van": 0, "26t": 0},           # no team code or grid reference in this script yet, so not used
-    "Aberdeen": {"HGV": 1, "Van": 0, "26t": 0},          # no team code or grid reference in this script yet, so not used
-    "Renfrew": {"HGV": 4, "Van": 0, "26t": 1},           # no team code or grid reference in this script yet, so not used
-}
+FLEET_CAP = fleet_caps()  # vehicles available per depot per day, by type; a depot or type left out has no limit
 # Added-km limit: an order may join a non-empty vehicle only if it adds at most this many km to
 # that vehicle's closed loop, so far-apart areas do not share a vehicle. Per depot and day the
 # limit starts at MAX_ADDED_KM and rises by ADDED_KM_STEP while the trucks are over the fleet,
 # up to ADDED_KM_CEILING. A day still over the fleet there is flagged "unresolved" and trimmed
 # to the fleet as before (fit_fleet: the extra orders go to the pallet network as "fleet").
-MAX_ADDED_KM = 60.0
-ADDED_KM_STEP = 20.0
-ADDED_KM_CEILING = 150.0
-ROUTE_DETAIL = True       # writes a "Route detail" sheet: every stop, leg and cumulative km (After plan)
+MAX_ADDED_KM = SETTINGS["routes"]["max_added_km"]
+ADDED_KM_STEP = SETTINGS["routes"]["added_km_step"]
+ADDED_KM_CEILING = SETTINGS["routes"]["added_km_ceiling"]
+ROUTE_DETAIL = SETTINGS["planning"]["route_detail"]   # writes a "Route detail" sheet: every stop, leg and cumulative km (After plan)
 PLANNED_COLOUR = "#1f5fa8"  # single planned route on the example maps
 ACTUAL_COLOUR = "#9a9a9a"   # actual routes, drawn behind the planned ones
 DAY_MAP_COLOURS = ["#1f5fa8", "#e07b00", "#2a9d3c", "#c0392b", "#8e5a9b", "#8c564b",
                    "#d6458f", "#17a2b8", "#b8860b", "#2c3e50"]   # planned routes on the full-day maps
-DAY_MAPS = True           # one map per depot, day and week of that depot's example routes: all planned routes
-EXAMPLE_MIN_DROPS = 4     # example maps only use routes with more than 3 drops (4 or more stops)
+DAY_MAPS = SETTINGS["planning"]["day_maps"]   # one map per depot, day and week of that depot's example routes: all planned routes
+EXAMPLE_MIN_DROPS = SETTINGS["planning"]["example_min_drops"]   # example maps only use routes with at least this many drops
 
 C_OUTPUT_PATH = (os.getenv("C_OUTPUT_PATH") or "").strip().strip('"').strip("'") or None   # raw orders CSV: default for the orders prompt
-PROMPT_SECONDS = 3        # the consolidated file is used if nothing is typed within this time
+PROMPT_SECONDS = SETTINGS["planning"]["prompt_seconds"]   # the consolidated file is used if nothing is typed within this time
 
 # Raw file column positions (0-based): I, J, K, Y, AG, AN
 DATE_COL, KG_COL, PAL_COL, TEAM_COL, ROUTE_COL, AREA_COL = 8, 9, 10, 24, 32, 39
-DEPOT_CODES = {"1001601": "Watford", "1001599": "Solihull",
-               "1001598": "Bristol Outbase", "1001593": "Doncaster",
-               "1001597": "Warrington"}
-PALLET = "Pallet network";
+DEPOT_CODES = TEAM_CODES  # team code -> depot, settings.toml [depots.team_codes]
+PALLET = "Pallet network"
 
-AUTO = False  # True = unattended: use the most recent run without asking
+AUTO = SETTINGS["planning"]["auto"]  # True = unattended: use the most recent run without asking
 
 # ---- Choose Anneal File run --------------------------------------------------------------
 def ask_path(prompt):
@@ -699,8 +686,13 @@ def vehicle_rows(week, depot, day, plan, vehicles, coords, depot_xy):
         areas = areas_of(v)
         order, km, stop_km, unlocated = vehicle_route(areas, coords, depot_xy)
         spec = VEHICLE_TYPES[v["type"]]
+        loads = {}
+        for area, kg, pal in v["items"]:
+            k, p_, n = loads.get(area, (0.0, 0.0, 0))
+            loads[area] = (k + kg, p_ + pal, n + 1)
         rows.append({"Week": week, "Depot": depot, "Day": day, "Plan": plan,
                      "Vehicle": i, "Type": v["type"], "Order": order, "Areas": ", ".join(sorted(areas)),
+                     "Loads": loads,   # area -> (kg, pallets, orders): one drop per area; for the report only
                      "Drops": max(len(order) - 2, 0),
                      "KG": round(v["kg"]), "Pallets": round(v["pal"], 1),
                      "KG fill %": round(v["kg"] / spec["kg"], 2),
@@ -740,45 +732,85 @@ def overflow_counts(over):
     return len(r), round(r["kg"].sum()), len(f), round(f["kg"].sum())
 
 
+def area_depots(plans):
+    """area -> depot whose plan holds it (its Districts or Outliers sheet)."""
+    out = {}
+    for depot, (new, pallet_areas) in sorted(plans.items()):
+        for area in list(new) + sorted(pallet_areas):
+            if area in out and out[area] != depot:
+                print(f"Area {area} is in the plans of both {out[area]} and {depot}; {out[area]} kept")
+                continue
+            out[area] = depot
+    return out
+
+
+def empty_pack():
+    return [], pd.DataFrame(columns=["Reason", "area", "kg", "pal"]), MAX_ADDED_KM, False
+
+
+_NOTED = set()   # depots with no plan already reported
+
+
 def simulate(label, wk, wo, plans, coords, depot_xy):
-    out = {"Daily": [], "Vehicles": [], "Moves": [], "Pallet_areas": [], "Overflow": [], "Checks": []}
-    weekday = wo[wo["day"].isin(DAYS)]
+    """Before: each order on its actual depot and day. After: each order on the depot whose
+    plan holds its postcode area, on that area's new day (map_days).
+
+    So a closing depot (no plan) keeps its "before" vehicles as a comparator, and its areas
+    are served "after" by the depots they were assigned to. Areas in no plan, and outliers,
+    go to the pallet network. Both sides use the same packing (pack).
+    """
+    out = {"Daily": [], "Vehicles": [], "Moves": [], "Pallet_areas": [], "Overflow": [],
+           "Checks": [], "Orders": []}
+    weekday = wo[wo["day"].isin(DAYS)].copy()
     out["Checks"].append({"Week": label, "Week ID": wk,
                           "Raw kg": round(wo["kg"].sum()),
                           "Weekend kg (not simulated)": round(wo.loc[~wo["day"].isin(DAYS), "kg"].sum())})
 
-    for depot in sorted(weekday["depot"].unique()):
-        if depot not in plans:
-            print(f"{label} {depot}: no anneal plan, skipped")
-            continue
+    area_dep = area_depots(plans)
+    weekday["new_depot"] = weekday["area"].map(area_dep).fillna(PALLET)
+    unmatched = sorted(set(weekday.loc[weekday["new_depot"] == PALLET, "area"]))
+    if unmatched:
+        print(f"{label}: {len(unmatched)} areas in no plan, sent to pallet network: {unmatched}")
+    caches = {d: {} for d in plans}
+    weekday["new_day"] = [
+        PALLET if nd == PALLET else target_day(r, plans[nd][0], plans[nd][1], caches[nd])
+        for nd, (_, r) in zip(weekday["new_depot"], weekday.iterrows())]
+    weekday.loc[weekday["new_day"] == PALLET, "new_depot"] = PALLET
+    out["Orders"].append(weekday.assign(Week=label))
+
+    no_plan = sorted(set(weekday["depot"]) - set(plans) - _NOTED)
+    _NOTED.update(no_plan)
+    for depot in no_plan:
+        print(f"{label} {depot}: no plan (closing or not active): kept in 'before' as a comparator, "
+              f"its areas served 'after' by their new depots")
+    depots = sorted(set(weekday["depot"]) | set(plans))
+    for depot in depots:
         if depot not in depot_xy:
-            raise SystemExit(f"No depot position for '{depot}'. Check the Depot names in the matrix "
-                             f"match DEPOT_CODES: {sorted(depot_xy)}")
-        new, pallet_areas = plans[depot]
+            raise SystemExit(f"No depot position for '{depot}'. Check the depot names in the matrix "
+                             f"or the depot info file match [depots.team_codes]: {sorted(depot_xy)}")
+
+    for depot in depots:
         caps = caps_for(depot)
         fleet = fleet_for(depot)
-        o = weekday[weekday["depot"] == depot].copy()
-        if o.empty:
+        own = weekday[weekday["depot"] == depot]          # before: its actual orders
+        served = weekday[weekday["new_depot"] == depot]   # after: the areas its plan holds
+        if own.empty and served.empty:
             continue
-        unmatched = set(o["area"]) - set(new) - pallet_areas
-        if unmatched:
-            print(f"{label} {depot}: {len(unmatched)} areas not in plan, sent to pallet network: "
-                  f"{sorted(unmatched)}")
-        cache = {}
-        o["new_day"] = o.apply(target_day, axis=1, plan_new=new,
-                               pallet_areas=pallet_areas, cache=cache)
-
         moved_out_total = moved_in_total = 0.0
         limits = {"Before": [], "After": []}
         for day in DAYS:
-            before = o[o["day"] == day]
-            after = o[o["new_day"] == day]
-            veh_b, over_b, lim_b, unres_b = pack(before, coords, depot_xy[depot], caps, fleet)
-            veh_a, over_a, lim_a, unres_a = pack(after, coords, depot_xy[depot], caps, fleet)
+            before = own[own["day"] == day]
+            after = served[served["new_day"] == day]
+            veh_b, over_b, lim_b, unres_b = (pack(before, coords, depot_xy[depot], caps, fleet)
+                                             if not before.empty else empty_pack())
+            veh_a, over_a, lim_a, unres_a = (pack(after, coords, depot_xy[depot], caps, fleet)
+                                             if not after.empty else empty_pack())
             limits["Before"].append(f"{day[:3]} {lim_b:.0f}{' UNRESOLVED' if unres_b else ''}")
             limits["After"].append(f"{day[:3]} {lim_a:.0f}{' UNRESOLVED' if unres_a else ''}")
-            moved_out = before.loc[(before["new_day"] != day) & (before["new_day"] != PALLET), "kg"].sum()
-            moved_in = after.loc[after["day"] != day, "kg"].sum()
+            # moved out: leaves this depot-day for another day or depot (not the pallet network)
+            moved_out = before.loc[((before["new_day"] != day) | (before["new_depot"] != depot))
+                                   & (before["new_day"] != PALLET), "kg"].sum()
+            moved_in = after.loc[(after["day"] != day) | (after["depot"] != depot), "kg"].sum()
             moved_out_total += moved_out
             moved_in_total += moved_in
             pallet = before[before["new_day"] == PALLET]
@@ -839,26 +871,35 @@ def simulate(label, wk, wo, plans, coords, depot_xy):
         for plan_name, parts in limits.items():
             print(f"{label} {depot} {plan_name}: added km limit {', '.join(parts)}")
 
-        mv = (o[(o["new_day"] != o["day"]) & (o["new_day"] != PALLET)]
-              .groupby(["area", "day", "new_day"])
-              .agg(kg=("kg", "sum"), orders=("kg", "size")).reset_index())
-        for _, r in mv.iterrows():
-            out["Moves"].append({"Week": label, "Depot": depot, "Area": r["area"],
-                                 "Old day": r["day"], "New day": r["new_day"],
-                                 "KG": round(r["kg"]), "Orders": int(r["orders"])})
-
-        pa = (o[o["new_day"] == PALLET].groupby(["area", "day"])
-              .agg(kg=("kg", "sum"), pal=("pal", "sum")).reset_index())
-        for _, r in pa.iterrows():
-            out["Pallet_areas"].append({"Week": label, "Depot": depot, "Area": r["area"],
-                                        "Day": r["day"], "KG": round(r["kg"]),
-                                        "Pallets": round(r["pal"], 1)})
-
         out["Checks"].append({"Week": label, "Week ID": wk, "Depot": depot,
-                              "Simulated KG": round(o["kg"].sum()),
+                              "Simulated KG": round(own["kg"].sum()),
                               "Moved out KG": round(moved_out_total),
                               "Moved in KG": round(moved_in_total),
                               "Moved difference": round(moved_out_total - moved_in_total, 1)})
+
+    # Moves and pallet-network areas, by the depot the orders came from
+    o = weekday
+    mv = (o[((o["new_day"] != o["day"]) | (o["new_depot"] != o["depot"])) & (o["new_day"] != PALLET)]
+          .groupby(["depot", "area", "day", "new_depot", "new_day"])
+          .agg(kg=("kg", "sum"), orders=("kg", "size")).reset_index())
+    for _, r in mv.iterrows():
+        out["Moves"].append({"Week": label, "Depot": r["depot"], "Area": r["area"],
+                             "Old day": r["day"], "New depot": r["new_depot"], "New day": r["new_day"],
+                             "KG": round(r["kg"]), "Orders": int(r["orders"])})
+
+    pa = (o[o["new_day"] == PALLET].groupby(["depot", "area", "day"])
+          .agg(kg=("kg", "sum"), pal=("pal", "sum")).reset_index())
+    for _, r in pa.iterrows():
+        out["Pallet_areas"].append({"Week": label, "Depot": r["depot"], "Area": r["area"],
+                                    "Day": r["day"], "KG": round(r["kg"]),
+                                    "Pallets": round(r["pal"], 1)})
+
+    # Network check: kg moved out of depot-days equals kg moved in (should be 0)
+    out_kg = sum(c.get("Moved out KG", 0) for c in out["Checks"] if "Depot" in c)
+    in_kg = sum(c.get("Moved in KG", 0) for c in out["Checks"] if "Depot" in c)
+    out["Checks"].append({"Week": label, "Week ID": wk, "Depot": "All depots (should be 0)",
+                          "Moved out KG": out_kg, "Moved in KG": in_kg,
+                          "Moved difference": round(out_kg - in_kg, 1)})
     return out
 
 
@@ -1190,7 +1231,8 @@ def safe_name(name):
 # ---- Main -----------------------------------------------------------------
 def main():
     orders = load_orders(choose_orders_path())
-    plans = load_plan(choose_planning_source())
+    plan_source = choose_planning_source()
+    plans = load_plan(plan_source)
     coords, depot_xy = load_grid_refs()
     print("Depot positions (km): " + ", ".join(f"{d} ({x:.1f}, {y:.1f})" for d, (x, y) in depot_xy.items()))
     missing = sorted(set(orders["area"]) - set(coords))
@@ -1211,13 +1253,15 @@ def main():
         row["Cap km used"] = caps_for(row["Depot"])[row["Type"]]
     cap_text = ", ".join(f"{d} HGV {c['HGV']:.1f} km" for d, c in ROUTE_CAP.items()) or "none, using HGV max_km"
     print(f"Route caps: {cap_text}; 26t uses the same truck cap; vans {VEHICLE_TYPES['Van']['max_km']:.0f} km (hard)")
-    planned_vehicles = []
+    planned_vehicles, all_vehicles, all_orders = [], [], []
     for band, wk in picks:
         wo = orders[orders["wk"] == wk]
         tables["Weeks"].append({"Band": band, "Week ID": wk,
                                 "KG": round(wo["kg"].sum()), "Routes": wo["route"].nunique()})
         res = simulate(wk, wk, wo, plans, coords, depot_xy)
         planned_vehicles += [v for v in res["Vehicles"] if v["Plan"] == "After" and v["Order"]]
+        all_vehicles += res["Vehicles"]
+        all_orders += res["Orders"]
         veh = pd.DataFrame(res["Vehicles"])
         km = {} if veh.empty else sum_route_km(veh, ["Plan"]).set_index("Plan")["Route km"].to_dict()
         tables["Weeks"][-1]["Route km before"] = round(km.get("Before", 0.0), 1)
@@ -1274,6 +1318,12 @@ def main():
         for name, rows in tables.items():
             pd.DataFrame(rows).to_excel(xl, sheet_name=name, index=False)
     print(f"Saved {out}")
+
+    if SETTINGS["planning"]["customer_report"]:
+        import customer_report
+        rep = customer_report.build(run_dir, RUN_STAMP, band_of, all_vehicles, pd.concat(all_orders),
+                                    tables["Daily"], orders, plan_source)
+        print(f"Saved {rep}")
 
 
 if __name__ == "__main__":

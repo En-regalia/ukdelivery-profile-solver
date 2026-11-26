@@ -1,8 +1,8 @@
 import os
+import sys
 import shutil
 from pathlib import Path
 from datetime import datetime
-import json
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -10,7 +10,9 @@ from dotenv import load_dotenv
 load_dotenv()
 ORDERS_PATH = Path(os.environ["ORDERS_PATH"])
 DEPOT_PATH = Path(os.environ["DEPOT_PATH"])
-TEAM_TO_DEPOT = json.loads(os.environ["TEAM_TO_DEPOT"])
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # settings.py sits one folder up
+from settings import TEAM_CODES
+TEAM_TO_DEPOT = TEAM_CODES     # settings.toml [depots.team_codes] (was TEAM_TO_DEPOT in .env)
 
 STAMP = datetime.now().strftime("%Y-%m-%d_%H-%M")
 

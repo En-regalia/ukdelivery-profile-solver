@@ -8,3 +8,4 @@ tqdm
 matplotlib 
 pillow 
 geopandas
+tomli; python_version < "3.11"

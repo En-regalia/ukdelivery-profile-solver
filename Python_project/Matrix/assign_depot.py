@@ -2,6 +2,7 @@
 
 
 import os
+import sys
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -10,6 +11,8 @@ import pandas as pd
 
 # ---- Settings -------------------------------------------------------------
 load_dotenv()
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # settings.py sits one folder up
+from settings import SETTINGS, ACTIVE_DEPOTS as _ACTIVE, LOCKED_DEPOTS, CLOSING_DEPOTS
 
 DEPOT_PATH = Path(os.environ["DEPOT_PATH"])
 DEPOT_INFO_PATH = Path(os.environ["DEPOT_INFO_PATH"])
@@ -19,15 +22,15 @@ AREA = "Postcode Area"
 DEPOT = "Depot"
 EAST, NORTH = "GRIDE_Ave", "GRIDN_Ave"
 
-PREFERRED_BONUS_KM = 15     # current depot treated as this many km closer
-MAX_KM = 150                 # flag areas further than this from their chosen depot
+PREFERRED_BONUS_KM = SETTINGS["assignment"]["preferred_bonus_km"]   # current depot treated as this many km closer
+MAX_KM = SETTINGS["assignment"]["max_km"]                            # flag areas further than this from their chosen depot
 
 # ---- Depot settings --------------------------------------------------------------
 
-# Only these depots are assigned areas. Leave empty to use every depot in the depot info file.
-ACTIVE_DEPOTS = ["Watford", "Doncaster", "Bristol Outbase", "Warrington"]
-
-locked = {"Bristol Outbase"}  # areas that are locked to their current depot
+# Depot lists come from settings.toml [depots]. Closing depots are never assigned areas.
+# An empty active list means every depot in the depot info file (except closing ones).
+ACTIVE_DEPOTS = [d for d in _ACTIVE if d not in CLOSING_DEPOTS]
+locked = set(LOCKED_DEPOTS)   # depots that keep their current areas and take no others
 
 
 # ---- Helpers --------------------------------------------------------------
@@ -108,6 +111,8 @@ def main():
         if missing:
             raise SystemExit(f"ACTIVE_DEPOTS not found in depot info (check spelling): {missing}")
         depot_xy = {d: depot_xy[d] for d in ACTIVE_DEPOTS}
+    else:
+        depot_xy = {d: xy for d, xy in depot_xy.items() if d not in CLOSING_DEPOTS}
     print(f"Active depots: {', '.join(depot_xy)}")
     inactive_locked = sorted(set(locked) - set(depot_xy))
     if inactive_locked:

@@ -1,0 +1,248 @@
+# =====================================================================================
+#  Postcode planning tools: settings
+# =====================================================================================
+#  Every value that tunes the depot assignment, anneal, sweep, planning estimate or the
+#  customer report lives here. Edit it in any text editor (Notepad is fine).
+#
+#  .env is only for secrets and paths on this machine (input files, output folders).
+#
+#  Format rules (TOML):
+#    - Text goes in "double quotes". Numbers and true/false do not.
+#    - Lists go in [square brackets], separated by commas.
+#    - Anything after # is a note and is ignored.
+#    - Depot names must match the depot info file exactly, including capitals and spaces.
+#  Each setting below says what it does and which scripts read it.
+# =====================================================================================
+
+
+# -------------------------------------------------------------------------------------
+[data]
+# -------------------------------------------------------------------------------------
+# Date the order data was extracted. Shown on the customer summary so readers know how
+# current the figures are. Read by: customer_report.py
+source_date = "2026-11-01"
+
+
+# -------------------------------------------------------------------------------------
+[depots]
+# -------------------------------------------------------------------------------------
+# Depots that receive postcode areas in the new plan. Leave empty ( [] ) to use every
+# depot in the depot info file.
+# Read by: Matrix/assign_depot.py (assignment), anneal_regional.py (which depots to plan),
+#          planning_estimate.py and customer_report.py (total fleet, depot status)
+active = ["Watford", "Doncaster", "Bristol Outbase", "Warrington"]
+
+# Depots that keep exactly their current postcode areas and take on no others.
+# Read by: Matrix/assign_depot.py, customer_report.py (status column)
+locked = ["Bristol Outbase"]
+
+# Depots that will close. They stay in the "before" figures as a comparator, get no
+# areas in the new plan, and are left out of the total fleet.
+# Read by: anneal_regional.py (warns if a matrix still gives them areas),
+#          planning_estimate.py, customer_report.py
+closing = ["Solihull"]
+
+# Team code (7 digits, from the orders file) -> depot name.
+# Read by: planning_estimate.py (orders file), Matrix/current_depot.py
+[depots.team_codes]
+"1001601" = "Watford"
+"1001599" = "Solihull"
+"1001598" = "Bristol Outbase"
+"1001593" = "Doncaster"
+"1001597" = "Warrington"
+
+
+# -------------------------------------------------------------------------------------
+[fleet]
+# -------------------------------------------------------------------------------------
+# Vehicles available per depot per day, by type. A depot or type left out has no limit.
+# The total fleet is the sum of these over the active depots (closing depots excluded).
+# Read by: planning_estimate.py (packing stops at these), sweep_plan.py (HGV + 26t = truck
+#          cap), customer_report.py (total fleet, allocation flags)
+"Watford"         = { HGV = 14, Van = 4, 26t = 2 }
+"Warrington"      = { HGV = 6,  Van = 1, 26t = 0 }
+"Doncaster"       = { HGV = 4,  Van = 0, 26t = 0 }
+"Bristol Outbase" = { HGV = 2,  Van = 1, 26t = 0 }
+# Solihull: no fleet cap yet (open item). While it is missing, Solihull's "before" packing
+# has no vehicle limit. To set one, remove the # from the next line and fill in the numbers.
+# "Solihull"      = { HGV = 3,  Van = 1, 26t = 1 }
+"Hebburn"         = { HGV = 3,  Van = 0, 26t = 0 }   # not active: no team code or position yet
+"Aberdeen"        = { HGV = 1,  Van = 0, 26t = 0 }   # not active
+"Renfrew"         = { HGV = 4,  Van = 0, 26t = 1 }   # not active
+
+
+# -------------------------------------------------------------------------------------
+[vehicles]
+# -------------------------------------------------------------------------------------
+# Size of each vehicle type: kg, pallets, and the longest straight-line route in km.
+# For HGV and 26t the depot's route cap (below) is used when it is lower.
+# Read by: planning_estimate.py, sweep_plan.py (HGV size is its vehicle proxy), customer_report.py (fill)
+HGV = { kg = 8000,  pallets = 15, max_km = 400.0 }   # 8t truck
+26t = { kg = 12000, pallets = 20, max_km = 400.0 }   # 26t truck: an 8t route upgraded when it saves a truck
+Van = { kg = 1000,  pallets = 5,  max_km = 500.0 }   # hard ceiling
+
+
+# -------------------------------------------------------------------------------------
+[routes]
+# -------------------------------------------------------------------------------------
+# Truck route cap per depot: this percentile of the depot's actual HGV route km, never above
+# the HGV max_km. 0.9 = 90th percentile. Read by: planning_estimate.py
+route_pct = 0.9
+
+# Added-km limit: an order may join a vehicle that already has stops only if it adds at most
+# this many km to that vehicle's loop, so far-apart areas do not share a vehicle.
+# Read by: planning_estimate.py (and sweep_plan.py through it)
+max_added_km = 60.0
+# If a depot-day needs more trucks than its fleet, the limit rises by this much and it repacks...
+added_km_step = 20.0
+# ...up to this ceiling. A day still over the fleet here is flagged "unresolved".
+added_km_ceiling = 150.0
+
+
+# -------------------------------------------------------------------------------------
+[patterns]
+# -------------------------------------------------------------------------------------
+# Most delivery days in one postcode area's weekly pattern.
+# Read by: matrix_common.py (anneal and sweep patterns)
+max_days = 3
+# A district counts as "next to" this many nearest districts.
+# Read by: matrix_common.py (anneal), sweep_plan.py
+neighbours = 4
+
+
+# -------------------------------------------------------------------------------------
+[assignment]
+# -------------------------------------------------------------------------------------
+# The current depot is treated as this many km closer, so an area only moves when another
+# depot is clearly nearer. Read by: Matrix/assign_depot.py
+preferred_bonus_km = 15
+# Areas further than this from their chosen depot are flagged for review. Read by: Matrix/assign_depot.py
+max_km = 150
+
+
+# -------------------------------------------------------------------------------------
+[anneal]
+# -------------------------------------------------------------------------------------
+# All read by: anneal_regional.py
+depot = ""                  # one depot name to run only that depot, or "" for every active depot
+remote_km = 150.0           # letters further than this from the depot's main body...
+min_districts = 2           # ...and with fewer weighted districts than this are treated as external
+group_size = 2              # about this many letter zones per group
+peak_tolerance = 0.03       # the busiest day may rise this far above the current busiest day (0.03 = 3%)
+peak_penalty = 500.0        # km added per 100% of peak above that limit
+peak_cost_km = 1000.0       # km of day radius a 100% peak reduction is worth (0 = ignore)
+spread_tolerance = 0.05     # busiest minus quietest day, as a share of the average day
+spread_penalty = 1000.0     # km added per 100% of spread above the tolerance
+spacing_days_km = 5.0       # km per unit of uneven spacing between a group's delivery days (0 = ignore)
+spacing_ideal_gap = 2       # ideal gap in days between deliveries (2 = every other day)
+day_loss_km = 10.0          # km cost per day short of a full week, averaged over kg
+isolation_km = 0            # districts averaging over this many km to neighbours are excluded (0 = use the percentile below)
+percentile = 98             # isolation percentile, used when isolation_km is 0
+max_copy_km = 15.0          # zero-volume districts further than this from a weighted one get no days
+iterations = 200000         # moves per restart
+restarts = 5                # independent restarts; the best is kept
+t_start = 10.0              # km: early moves may worsen the cost by about this much
+t_end = 0.05                # km: late moves must almost always improve
+seed = 0                    # random seed, so runs repeat exactly
+route_tolerance = 0.00      # allowance above the route baseline (0.10 = 10% over)
+kg_tolerance = 0.10         # a group's kg may differ from its target by this share
+tour_starts = 20            # starting points tried per route (speed against accuracy)
+make_maps = true            # draw the day maps into each depot workbook
+auto_open = true            # open the run folder when finished (full_run.py turns this off)
+
+# Route baseline per depot, km (95th percentile of planned route lengths, from baseline_length.py)
+[anneal.route_baseline_km]
+"Bristol Outbase" = 494.3
+"Doncaster"       = 343.0
+"Warrington"      = 348.1
+"Watford"         = 476.4
+
+
+# -------------------------------------------------------------------------------------
+[sweep]
+# -------------------------------------------------------------------------------------
+# All read by: sweep_plan.py. Objective weights are starting points: tune on real weeks.
+spread_veh = 2              # target: busiest minus quietest day, in vehicles, across the week
+spread_tol = 0.05           # kg spread tolerance (same idea as the anneal's spread_tolerance)
+max_passes = 20             # improvement passes over all districts
+v_spread = 10.0             # cost per vehicle of spread, per week
+v_over = 100.0              # cost per vehicle of spread above spread_veh, per week
+cap_pen = 1000.0            # cost per vehicle above the depot's truck cap, per day
+kg_pen = 2000.0             # cost per 100% of kg spread above spread_tol, per week
+km_w = 0.001                # cost per km of route proxy, summed over weeks
+make_maps = true            # draw the day maps into each depot workbook
+
+
+# -------------------------------------------------------------------------------------
+[planning]
+# -------------------------------------------------------------------------------------
+# All read by: planning_estimate.py
+auto = false                # true = unattended: use the most recent anneal or sweep run without asking
+prompt_seconds = 3          # seconds to wait for a typed orders path before using the default
+route_detail = true         # write the "Route detail" sheet (every stop of every planned route)
+example_min_drops = 4       # example maps only use routes with at least this many drops
+day_maps = true             # draw a full-day map per depot and day for the example weeks
+customer_report = true      # write the customer reporting workbook
+
+
+# -------------------------------------------------------------------------------------
+[report]
+# -------------------------------------------------------------------------------------
+# All read by: customer_report.py
+# Scenario, in plain words, printed at the top of the customer summary.
+scenario = "Solihull closes and its volume moves to Watford, Warrington and Doncaster. Bristol's volume reduces significantly. Solihull is kept in the 'before' figures as a comparator."
+fill_target = 0.90          # target vehicle fill (0.90 = 90%), shown against the fill figures
+
+# A postcode area's "old pattern" is the weekdays that carried at least this share of its
+# weekday kg across the whole order file (0.05 = 5%). Used for service stability.
+old_pattern_min_share = 0.05
+
+# Order size bands in kg, for the order size table. Each number is the top of a band;
+# a final "over" band is added. "Small" orders are those in the first band(s) up to small_order_kg.
+order_size_bands_kg = [100, 250, 500, 1000, 3000]
+small_order_kg = 250
+
+# Fleet allocation flags (for review; vehicles are never moved automatically).
+# "Short": the depot needed more of a type than its cap on at least this share of days.
+allocation_short_share = 0.20
+# "Spare": the cap is at least one vehicle above what the depot used on this share of days
+# (0.90 = the 90th percentile day still leaves a vehicle spare).
+allocation_spare_pct = 0.90
+
+
+# -------------------------------------------------------------------------------------
+[cost]
+# -------------------------------------------------------------------------------------
+# Delivery budget, for cost per kg and per pallet. All read by: customer_report.py
+# mode = "annual": enter annual_total. It is split by working days:
+#        annual_total / working days in budget_year x working days in the sample weeks.
+# mode = "monthly": enter a figure for each month below. Each sample day gets its month's
+#        figure divided by that month's working days.
+# Leave annual_total at 0 (and the months at 0) to leave cost out of the report.
+mode = "annual"
+annual_total = 0
+budget_year = 2026
+currency = "£"
+
+# Share of cost that follows the number of vehicle-days (driver, vehicle hire); the rest
+# follows km (fuel, wear). The "after" cost is the budget scaled by these two ratios.
+vehicle_share = 0.70
+
+# Bank holidays in the budget year, not counted as working days (yyyy-mm-dd).
+bank_holidays = ["2026-01-01", "2026-04-03", "2026-04-06", "2026-05-04", "2026-05-25",
+                 "2026-08-31", "2026-12-25", "2026-12-28"]
+
+# Used only when mode = "monthly".
+[cost.monthly]
+Jan = 0
+Feb = 0
+Mar = 0
+Apr = 0
+May = 0
+Jun = 0
+Jul = 0
+Aug = 0
+Sep = 0
+Oct = 0
+Nov = 0
+Dec = 0
