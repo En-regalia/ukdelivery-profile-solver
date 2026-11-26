@@ -454,7 +454,7 @@ def main(argv=None):
     checks.insert(0, "Section", checks.pop("Section"))
 
     notes = notes_rows(args, orders_path, matrix_common.MATRIX_PATH, pcts, seeds, n_time, route_cap_fixed,
-                       pe, picks, t_first, t_rest, cache, time.time() - started)
+                       pe, picks, t_first, t_rest, cache, time.time() - started, depot_xy)
     base_cols = ["Band"] + [c for c in base.columns if c != "Band"]
     with pd.ExcelWriter(out) as xl:
         base[base_cols].to_excel(xl, sheet_name="Baseline", index=False)
@@ -527,8 +527,29 @@ def summarise(pd, scen, base, band_of):
     return out[lead + [c for c in out.columns if c not in lead]]
 
 
+def DEPOT_GRID_KM():
+    import routing
+    return routing.DEPOT_GRID_KM
+
+
+def routing_version():
+    """Last git commit that touched routing.py, plus whether the working copy differs from it."""
+    import subprocess
+    here = Path(__file__).parent
+    try:
+        log = subprocess.run(["git", "log", "-1", "--format=%h %ad %s", "--date=short", "--", "routing.py"],
+                             cwd=here, capture_output=True, text=True, timeout=10).stdout.strip()
+        dirty = subprocess.run(["git", "status", "--porcelain", "--", "routing.py"],
+                               cwd=here, capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown (git not available)"
+    if not log:
+        return "unknown (not a git checkout)"
+    return log + (" (with local changes)" if dirty else "")
+
+
 def notes_rows(args, orders_path, matrix_path, pcts, seeds, n_time, route_cap, pe, picks,
-               t_first, t_rest, cache, total_s):
+               t_first, t_rest, cache, total_s, depot_xy):
     rows = [("Run", datetime.now().strftime("%Y-%m-%d %H:%M")),
             ("Orders CSV", str(orders_path)),
             ("Plan (anneal run)", str(Path(args.plan))),
@@ -542,6 +563,11 @@ def notes_rows(args, orders_path, matrix_path, pcts, seeds, n_time, route_cap, p
             ("ROUTE_CAP", "computed once from the unreduced actual routes, fixed for every scenario"),
             ]
     rows += [(f"ROUTE_CAP {d}", f"HGV and 26t {c['HGV']:.1f} km") for d, c in sorted(route_cap.items())]
+    rows += [("Routing version", routing_version()),
+             ("Depot positions", "routing.DEPOT_GRID_KM where set, else the kg-weighted centre of the depot's "
+                                 "areas in the matrix (depot info file for a depot with no areas). Set in "
+                                 "DEPOT_GRID_KM: " + (", ".join(sorted(DEPOT_GRID_KM())) or "none"))]
+    rows += [(f"Depot position {d}", f"{x:.2f}, {y:.2f} km") for d, (x, y) in sorted(depot_xy.items())]
     rows += [(f"FLEET_CAP {d}", ", ".join(f"{t} {n}" for t, n in caps.items()))
              for d, caps in sorted(pe.FLEET_CAP.items())]
     rows += [(f"Vehicle {t}", f"{s['kg']:g} kg, {s['pallets']:g} pallets, {s['max_km']:g} km")
