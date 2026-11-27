@@ -113,6 +113,7 @@ COVER_ALWAYS = [str(a).strip().upper() for a in S.get("cover_always", [])]  # ar
 MAX_FLEET = {d: dict(v) for d, v in S.get("max_fleet", {}).items()}   # depot -> {type: vehicles}, the ceiling
 FILL_TARGET = SETTINGS["report"]["fill_target"]               # each max_fleet vehicle counts at this fill
 MAKE_MAP = S.get("make_map", True)                            # draw the depot coverage map at the end
+MAP_AREA_CAP_KM = S.get("map_area_cap_km", 30.0)              # coverage map: an area reaches at most this far from its grid ref
 
 # Orders file columns (same as Matrix/build_matrix.py)
 DATE_COL, WEIGHT_COL, STATE_COL = "date", "Weight", "stateText"
@@ -860,54 +861,82 @@ DEPOT_COLOURS = ["#1f5fa8", "#d9731a", "#2e8b57", "#a83279", "#7a5c2e", "#5a5a9e
 DEPOT_INFO_XY = {}   # every depot in the depot info file (closing ones too), for the "current depots" map
 
 
+def coverage_cells(pts, outline, cap_km):
+    """One approximate area per postcode area: the land nearer its grid reference than any other
+    area's (a Voronoi cell), clipped to the UK outline (if loaded) and to cap_km around the grid
+    reference, so a lone area far from its neighbours does not fill half the country.
+    Returns a GeoSeries in the same row order as pts."""
+    import geopandas as gpd
+    import shapely
+    from shapely.geometry import MultiPoint, Point
+
+    xy = pts[[EAST, NORTH]].to_numpy(dtype=float)
+    uniq = np.unique(xy, axis=0)                     # areas sharing a grid reference share a cell
+    land = outline.union_all() if outline is not None else MultiPoint(uniq).envelope.buffer(cap_km * 1000)
+    cells = shapely.voronoi_polygons(MultiPoint(uniq), extend_to=land.envelope.buffer(cap_km * 1000)).geoms
+    cell_gdf = gpd.GeoDataFrame(geometry=list(cells), crs=27700)
+    pt_gdf = gpd.GeoDataFrame({"_i": range(len(pts))}, geometry=gpd.points_from_xy(xy[:, 0], xy[:, 1]), crs=27700)
+    hit = gpd.sjoin(pt_gdf, cell_gdf, predicate="within").drop_duplicates("_i").set_index("_i")["index_right"]
+    geoms = []
+    for i, (e, n) in enumerate(xy):
+        cell = cell_gdf.geometry.iloc[hit[i]] if i in hit.index else Point(e, n).buffer(1000)
+        geoms.append(cell.intersection(land).intersection(Point(e, n).buffer(cap_km * 1000)))
+    return gpd.GeoSeries(geoms, index=pts.index, crs=27700)
+
+
 def draw_coverage_map(result, depot_xy, xlsx_path):
     """Map of each depot and the postcode areas it covers: current depots beside the new assignment.
 
-    One dot per area at its grid reference, coloured by depot and sized by kg per day (no area labels,
-    so the coverage reads at a glance; the Assignment sheet lists every area). Depots are stars. Flagged areas have a black ring. Saved as a PNG next to the
-    workbook and added to it as a "Map" sheet. The UK outline comes from MAP_IMAGE_PATH in .env, if set.
+    Each postcode area is drawn as an approximate area (see coverage_cells) filled in its depot's
+    colour, with a dark line where one depot's patch meets another's. No area labels, so the coverage
+    reads at a glance; the Assignment sheet lists every area. Depots are white stars. Flagged
+    areas are hatched, except the cover depot's routine "cover" flags. Saved as a PNG next to the workbook and added to it as a "Map" sheet. The UK outline comes
+    from MAP_IMAGE_PATH in .env, if set (without it the areas are not clipped to the coast).
     """
     os.environ.setdefault("MAP_IMAGE_PATH", "")          # maps_common reads it at import
     from maps_common import MAP_DPI, add_maps_sheet, load_uk_outline, plt
+    import geopandas as gpd
+    from matplotlib.patches import Patch
 
     outline = load_uk_outline()
     pts = result[(result[EAST] > 0) & (result[NORTH] > 0)].copy()
     kg = pts["_kg"].to_numpy(dtype=float) if "_kg" in pts else np.zeros(len(pts))
-    peak = kg.max() if len(kg) and kg.max() > 0 else 1.0
-    size = 20 + 180 * np.sqrt(kg / peak)
     shown = list(depot_xy) + sorted((set(pts["Current depot"]) | set(pts[DEPOT])) - set(depot_xy) - {"", LEFTOVER})
     colour = {d: DEPOT_COLOURS[i % len(DEPOT_COLOURS)] for i, d in enumerate(shown)}
     colour[LEFTOVER] = colour[""] = "#9a9a9a"
-    flagged = (pts["Review"].fillna("") != "").to_numpy()
+    # Hatched: flagged areas, except Bristol's routine cover areas (flagged on every run by design)
+    review = pts["Review"].fillna("")
+    flagged = ((review != "") & ~review.str.startswith(f"{COVER_DEPOT} cover (")).to_numpy()
     all_xy = {**DEPOT_INFO_XY, **depot_xy}
-
+    cells = gpd.GeoDataFrame(pts[["Current depot", DEPOT]].reset_index(drop=True),
+                             geometry=coverage_cells(pts, outline, MAP_AREA_CAP_KM).reset_index(drop=True), crs=27700)
+    cells = cells[~cells.geometry.is_empty]
     fig, axes = plt.subplots(1, 2, figsize=(16, 11))
     for ax, col, title in ((axes[0], "Current depot", "Current depots"), (axes[1], DEPOT, "New assignment")):
         if outline is not None:
-            outline.plot(ax=ax, color="#e6e6e6", edgecolor="white", linewidth=0.3)
-        ax.scatter(pts[EAST], pts[NORTH], s=size, c=[colour.get(d, "#9a9a9a") for d in pts[col]],
-                   alpha=0.75, linewidths=0)
+            outline.plot(ax=ax, color="#eeeeee", edgecolor="white", linewidth=0.3)
+        cells.plot(ax=ax, color=[colour.get(d, "#9a9a9a") for d in cells[col]], edgecolor="white", linewidth=0.15)
+        cells.dissolve(by=col).boundary.plot(ax=ax, color="#222222", linewidth=0.9)   # depot borders
         if col == DEPOT and flagged.any():
-            ax.scatter(pts.loc[flagged, EAST], pts.loc[flagged, NORTH], s=size[flagged] + 30,
-                       facecolors="none", edgecolors="black", linewidths=0.9)
+            cells[flagged[cells.index]].plot(ax=ax, facecolor="none", edgecolor="black", hatch="////", linewidth=0)
         depots_here = [d for d in shown if d in set(pts[col])]
         for d in depots_here:
             if d in all_xy:
                 e, n = all_xy[d]
-                ax.scatter([e], [n], marker="*", s=420, c=colour[d], edgecolors="black", linewidths=1, zorder=5)
-                ax.annotate(d, (e, n), xytext=(8, -12), textcoords="offset points", fontsize=10, fontweight="bold")
-        legend = [plt.Line2D([], [], marker="o", ls="", color=colour[d], markersize=9,
-                             label=f"{d}: {(pts[col] == d).sum()} areas, "
-                                   f"{5 * kg[(pts[col] == d).to_numpy()].sum():,.0f} kg/wk")
+                ax.plot([e], [n], marker="*", markersize=22, markerfacecolor="white",
+                        markeredgecolor="black", markeredgewidth=1, ls="", zorder=10)
+                ax.annotate(d, (e, n), xytext=(10, -14), textcoords="offset points", fontsize=10,
+                            fontweight="bold", zorder=11)
+        legend = [Patch(facecolor=colour[d], label=f"{d}: {(pts[col] == d).sum()} areas, "
+                                                    f"{5 * kg[(pts[col] == d).to_numpy()].sum():,.0f} kg/wk")
                   for d in depots_here]
         if col == DEPOT and flagged.any():
-            legend.append(plt.Line2D([], [], marker="o", ls="", markerfacecolor="none", markeredgecolor="black",
-                                     markersize=9, label="Flagged (see Flagged sheet)"))
-        ax.legend(handles=legend, loc="upper left", fontsize=9, frameon=True)
-        if outline is not None:
-            minx, miny, maxx, maxy = outline.total_bounds
-            ax.set_xlim(minx, maxx)
-            ax.set_ylim(miny, maxy)
+            legend.append(Patch(facecolor="none", edgecolor="black", hatch="////", label="Flagged (see Flagged sheet; routine Bristol cover not hatched)"))
+        ax.legend(handles=legend, loc="upper right", fontsize=9, frameon=True)
+        minx, miny, maxx, maxy = cells.total_bounds
+        pad = 20000
+        ax.set_xlim(minx - pad, maxx + pad)
+        ax.set_ylim(miny - pad, maxy + pad)
         ax.set_aspect("equal")
         ax.set_axis_off()
         ax.set_title(title, fontsize=14, fontweight="bold")
