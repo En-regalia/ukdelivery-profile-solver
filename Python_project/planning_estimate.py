@@ -1389,8 +1389,9 @@ def main():
             depot_dir = example_dir / safe_name(v["Depot"])      # one folder per depot
             depot_dir.mkdir(exist_ok=True)
             name = (f"{date_tag(v['Week'], v['Day'])}_{v['Depot']}_{v['Type']}_vehicle_{v['Vehicle']}_{kind}.png")
+            comp, _ = comparator_route(v, actual)
             png = draw_route_map(kind, v, coords, depot_xy, outline, depot_dir / safe_name(name),
-                                 matching_actual_routes(v, actual))
+                                 [comp] if comp is not None else [])
         print(f"Days Maps Saved {png}")
 
         if DAY_MAPS:
