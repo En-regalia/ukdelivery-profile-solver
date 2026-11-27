@@ -80,8 +80,8 @@ closing = ["Solihull"]
 # Size of each vehicle type: kg, pallets, and the longest straight-line route in km.
 # For HGV and 26t the depot's route cap (below) is used when it is lower.
 # Read by: planning_estimate.py, sweep_plan.py (HGV size is its vehicle proxy), customer_report.py (fill)
-HGV = { kg = 8000,  pallets = 15, max_km = 400.0 }   # 8t truck
-26t = { kg = 12000, pallets = 20, max_km = 400.0 }   # 26t truck: an 8t route upgraded when it saves a truck
+HGV = { kg = 8000,  pallets = 15, max_km = 400.0 }   # 18t truck
+26t = { kg = 12000, pallets = 20, max_km = 400.0 }   # 26t truck: an 18t route upgraded when it saves a truck
 Van = { kg = 1000,  pallets = 5,  max_km = 500.0 }   # hard ceiling
 
 
