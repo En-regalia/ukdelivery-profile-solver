@@ -37,8 +37,8 @@ No prompts. Run, for example:
   python scenario_reduction.py --plan "C:/.../Anneal output/Run_2026-11-20_10-00" --matrix built
 
 Settings: the orders CSV is C_OUTPUT_PATH from .env unless --orders is given. The workbook
-goes to P_OUTPUT_DIR/Run_<stamp>/Scenario_reduction_<stamp>.xlsx (or --out instead of
-P_OUTPUT_DIR). The matrix is "built" (MATRIX_OUT), "current" (MATRIX_CURRENT) or a path;
+goes to R_OUTPUT_DIR/Run_<stamp>/Scenario_reduction_<stamp>.xlsx (or --out instead of
+R_OUTPUT_DIR; if neither is set, P_OUTPUT_DIR). The matrix is "built" (MATRIX_OUT), "current" (MATRIX_CURRENT) or a path;
 use the same one planning_estimate used, or the baseline will not reproduce.
 """
 import argparse
@@ -77,7 +77,7 @@ def parse_args(argv=None):
     p.add_argument("--orders", help="orders CSV (default: C_OUTPUT_PATH in .env)")
     p.add_argument("--matrix", default="built",
                    help='"built" (MATRIX_OUT), "current" (MATRIX_CURRENT) or a path. Default: built')
-    p.add_argument("--out", help="output folder (default: P_OUTPUT_DIR in .env)")
+    p.add_argument("--out", help="output folder (default: R_OUTPUT_DIR in .env, else P_OUTPUT_DIR)")
     p.add_argument("--pcts", default="5,10,20", help="reductions in percent, comma separated")
     p.add_argument("--seeds", type=int, default=20, help="random-orders seeds (default 20)")
     p.add_argument("--timing-seeds", type=int, default=3,
@@ -100,10 +100,19 @@ def prepare_environment(args):
     load_dotenv()
     plan = Path(args.plan)
     os.environ.setdefault("A_OUTPUT_DIR", str(plan.parent if plan.is_file() else plan))
+    # Output folder: --out, else R_OUTPUT_DIR in .env, else P_OUTPUT_DIR (the planning_estimate folder)
+    def env_path(key):
+        return (os.getenv(key) or "").strip().strip('"').strip("'")
     if args.out:
-        os.environ["P_OUTPUT_DIR"] = args.out
-    if not os.getenv("P_OUTPUT_DIR"):
-        raise SystemExit("P_OUTPUT_DIR is not set in .env and --out was not given")
+        args.out_dir, source = args.out.strip().strip('"').strip("'"), "--out"
+    elif env_path("R_OUTPUT_DIR"):
+        args.out_dir, source = env_path("R_OUTPUT_DIR"), "R_OUTPUT_DIR"
+    elif env_path("P_OUTPUT_DIR"):
+        args.out_dir, source = env_path("P_OUTPUT_DIR"), "P_OUTPUT_DIR (R_OUTPUT_DIR is not set)"
+    else:
+        raise SystemExit("No output folder: set R_OUTPUT_DIR in .env, or pass --out")
+    print(f"Output folder ({source}): {args.out_dir}")
+    os.environ.setdefault("P_OUTPUT_DIR", args.out_dir)   # planning_estimate needs it at import; not used here
     if args.matrix not in ("built", "current"):
         os.environ.setdefault("MATRIX_OUT", args.matrix)
         os.environ.setdefault("MATRIX_CURRENT", args.matrix)
@@ -460,7 +469,7 @@ def main(argv=None):
     summary = summarise(pd, scen, base, band_of)
 
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
-    run_dir = Path(os.environ["P_OUTPUT_DIR"]) / f"Run_{stamp}"
+    run_dir = Path(args.out_dir) / f"Run_{stamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     export_rows = []
