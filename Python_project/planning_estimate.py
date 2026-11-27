@@ -69,6 +69,8 @@ import pandas as pd
 from matrix_common import AREA, DAYS, map_days
 from routing import DEPOT_KEY, load_grid_refs, route_legs, sum_route_km, vehicle_route
 from maps_common import MAP_DPI, load_uk_outline
+import postcodes
+from routing import area_of
 import matplotlib.pyplot as plt
 
 # ---- dir paths and environment variables -------------------------------------------------------------
@@ -112,6 +114,13 @@ PROMPT_SECONDS = SETTINGS["planning"]["prompt_seconds"]   # the consolidated fil
 
 # Raw file column positions (0-based): I, J, K, Y, AG, AN
 DATE_COL, KG_COL, PAL_COL, TEAM_COL, ROUTE_COL, AREA_COL = 8, 9, 10, 24, 32, 39
+POSTCODE_NAME = "dropoffPostCode"     # delivery postcode column, by header name (stops; see postcodes.py)
+STATE_NAME = "stateText"              # order state column, by header name
+CANCELLED_STATES = ["Cancelled"]      # left out of the planning estimate, before and after
+# Actual (before) figures: the raw orders file, ORDERS_PATH in .env (the file build_matrix reads).
+# Real routes by route ID, with no builder consolidation. Not set: the planning orders are used.
+ORDERS_PATH = (os.getenv("ORDERS_PATH") or "").strip().strip('"').strip("'") or None
+EXTRA_TRUCKS_MAX = SETTINGS["report"].get("max_extra_vehicles", 3)   # extra 18t trucks tried on a day with fleet overflow
 DEPOT_CODES = TEAM_CODES  # team code -> depot, settings.toml [depots.team_codes]
 PALLET = "Pallet network"
 
@@ -166,8 +175,16 @@ def num(s):
     return pd.to_numeric(s, errors="coerce").fillna(0.0)
 
 
-def load_orders(path):
+def load_orders(path, drop_cancelled=False):
+    """Orders from a raw-format csv (raw file, ORDERS_PATH, or the consolidated C_OUTPUT_PATH).
+
+    Columns by position (DATE_COL ...); the delivery postcode (POSTCODE_NAME) and order state
+    (STATE_NAME) by header name, when present. drop_cancelled=True leaves out orders whose state
+    is in CANCELLED_STATES. Row order is kept (scenario_reduction.py matches rows by position,
+    so it loads with drop_cancelled=False).
+    """
     raw = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    cols = {c.strip(): c for c in raw.columns}
     o = pd.DataFrame({
         "date": pd.to_datetime(raw.iloc[:, DATE_COL].str.strip(), format="%Y%m%d", errors="coerce"),
         "team": raw.iloc[:, TEAM_COL].str.strip(),
@@ -176,7 +193,14 @@ def load_orders(path):
         "kg": num(raw.iloc[:, KG_COL]),
         "pal": num(raw.iloc[:, PAL_COL]),
     })
+    o["postcode"] = (postcodes.norm_postcode(raw[cols[POSTCODE_NAME]]) if POSTCODE_NAME in cols else "")
+    o["state"] = raw[cols[STATE_NAME]].str.strip() if STATE_NAME in cols else ""
     print(f"Rows read: {len(o):,}")
+    if drop_cancelled:
+        cancelled = o["state"].isin(CANCELLED_STATES)
+        print(f"Cancelled orders left out: {int(cancelled.sum()):,}"
+              + ("" if STATE_NAME in cols else f" (no {STATE_NAME} column)"))
+        o = o[~cancelled]
     print(f"Unreadable dates dropped: {o['date'].isna().sum()}")
     o = o.dropna(subset=["date"])
     o["depot"] = o["team"].map(DEPOT_CODES)
@@ -481,11 +505,12 @@ def place(orders, route_km, cap, vtype="HGV"):
     Returns (vehicles, orders blocked by the route cap as (area, kg, pal) tuples).
     """
     vehicles, cap_over = [], []
-    area_order = orders.groupby("area")["kg"].sum().sort_values(ascending=False).index
-    for area in area_order:
+    group = "district" if "district" in orders.columns else "area"   # "area" holds the stop key
+    area_order = orders.groupby(group)["kg"].sum().sort_values(ascending=False).index
+    for district in area_order:
         own = []
-        items = orders[orders["area"] == area].sort_values("kg", ascending=False)
-        for kg, pal in zip(items["kg"], items["pal"]):
+        items = orders[orders[group] == district].sort_values("kg", ascending=False)
+        for area, kg, pal in zip(items["area"], items["kg"], items["pal"]):
             v = next((v for v in own if fits(v, kg, pal)
                       and route_km(set(areas_of(v)) | {area}) <= cap), None)
             if v is None:
@@ -680,6 +705,10 @@ def pack_at(orders, coords, route_km, caps, fleet, limit):
     Returns (vehicles, overflow DataFrame with Reason "route cap", "too big" or "fleet",
     True if the trucks were over the fleet before fit_fleet).
     """
+    # Vehicles carry stops: "area" below is each order's stop key (its postcode, or its district
+    # centre; see postcodes.py) and "district" its postcode district, which place() groups by.
+    stop = orders["stop"] if "stop" in orders.columns else orders["area"]
+    orders = orders.assign(district=orders["area"], area=stop)
     spec = VEHICLE_TYPES["Van"]
     eligible = (orders["kg"] <= spec["kg"]) & (orders["pal"] <= spec["pallets"])
 
@@ -700,6 +729,7 @@ def pack_at(orders, coords, route_km, caps, fleet, limit):
             + [("too big", a, k, p) for a, k, p in too_big[["area", "kg", "pal"]].itertuples(index=False, name=None)]
             + [("fleet", a, k, p) for a, k, p in fleet_over])
     overflow = pd.DataFrame(rows, columns=["Reason", "area", "kg", "pal"])
+    overflow["area"] = overflow["area"].map(area_of)    # report overflow by district
     return vans + trucks, overflow, over
 
 
@@ -707,24 +737,26 @@ def vehicle_rows(week, depot, day, plan, vehicles, coords, depot_xy):
     rows = []
     # trucks listed first (26t, then 18t), then vans, each by weight
     for i, v in enumerate(sorted(vehicles, key=lambda v: (v["type"] == "Van", v["type"] != "26t", -v["kg"])), start=1):
-        areas = areas_of(v)
-        order, km, stop_km, unlocated = vehicle_route(areas, coords, depot_xy)
+        stops = areas_of(v)
+        order, km, stop_km, unlocated = vehicle_route(stops, coords, depot_xy)
         spec = VEHICLE_TYPES[v["type"]]
         loads = {}
-        for area, kg, pal in v["items"]:
+        for stop, kg, pal in v["items"]:
+            area = area_of(stop)
             k, p_, n = loads.get(area, (0.0, 0.0, 0))
             loads[area] = (k + kg, p_ + pal, n + 1)
         rows.append({"Week": week, "Depot": depot, "Day": day, "Plan": plan,
-                     "Vehicle": i, "Type": v["type"], "Order": order, "Areas": ", ".join(sorted(areas)),
-                     "Loads": loads,   # area -> (kg, pallets, orders): one drop per area; for the report only
-                     "Drops": max(len(order) - 2, 0),
+                     "Vehicle": i, "Type": v["type"], "Order": order, "Areas": ", ".join(sorted(loads)),
+                     "Loads": loads,   # district -> (kg, pallets, orders); for the report only
+                     "Drops": len(v["items"]),          # every order is a drop
+                     "Delivery points": len(stops),     # distinct postcodes (or district centres) visited
                      "KG": round(v["kg"]), "Pallets": round(v["pal"], 1),
                      "KG fill %": round(v["kg"] / spec["kg"], 2),
                      "Pallet fill %": round(v["pal"] / spec["pallets"], 2),
                      "Route km": round(km, 1),
                      "Over van 500 km": v["type"] == "Van" and km > VEHICLE_TYPES["Van"]["max_km"],
                      "Stop km": round(stop_km, 1),
-                     "Areas without grid ref": len(unlocated)})
+                     "Areas without grid ref": len({area_of(s) for s in unlocated})})
     return rows
 
 
@@ -775,13 +807,28 @@ def empty_pack():
 _NOTED = set()   # depots with no plan already reported
 
 
-def simulate(label, wk, wo, plans, coords, depot_xy):
+def extra_trucks_needed(orders, coords, depot_xy, caps, fleet):
+    """Fewest extra 18t trucks (1 to EXTRA_TRUCKS_MAX) that leave no fleet overflow when the
+    depot-day is packed again with them, or None if that many still leave some."""
+    if fleet["HGV"] is None:
+        return None
+    for k in range(1, EXTRA_TRUCKS_MAX + 1):
+        _, over, _, _ = pack(orders, coords, depot_xy, caps, {**fleet, "HGV": fleet["HGV"] + k})
+        if not (over["Reason"] == "fleet").any():
+            return k
+    return None
+
+
+def simulate(label, wk, wo, plans, coords, depot_xy, extra_check=False):
     """Before: each order on its actual depot and day. After: each order on the depot whose
     plan holds its postcode area, on that area's new day (map_days).
 
     So a closing depot (no plan) keeps its "before" vehicles as a comparator, and its areas
     are served "after" by the depots they were assigned to. Areas in no plan, and outliers,
     go to the pallet network. Both sides use the same packing (pack).
+
+    extra_check=True: on an "after" day with fleet overflow, the day is packed again with 1, 2 ...
+    extra 18t trucks to find how many would carry it all (Daily "Extra trucks needed after").
     """
     out = {"Daily": [], "Vehicles": [], "Moves": [], "Pallet_areas": [], "Overflow": [],
            "Checks": [], "Orders": []}
@@ -860,6 +907,10 @@ def simulate(label, wk, wo, plans, coords, depot_xy):
             vans_a, hgvs_a, t26_a = type_counts(veh_a)
             rc_b_n, rc_b_kg, fl_b_n, fl_b_kg = overflow_counts(over_b)
             rc_a_n, rc_a_kg, fl_a_n, fl_a_kg = overflow_counts(over_a)
+            fl_a_pal = round(over_a.loc[over_a["Reason"] == "fleet", "pal"].sum(), 1)
+            rc_a_pal = round(over_a.loc[over_a["Reason"] != "fleet", "pal"].sum(), 1)
+            extra = (extra_trucks_needed(after, coords, depot_xy[depot], caps, fleet)
+                     if extra_check and fl_a_n else None)
 
             out["Daily"].append({
                 "Week": label, "Depot": depot, "Day": day,
@@ -889,6 +940,9 @@ def simulate(label, wk, wo, plans, coords, depot_xy):
                 "Over route cap after KG": rc_a_kg,
                 "Over fleet after orders": fl_a_n,
                 "Over fleet after KG": fl_a_kg,
+                "Over fleet after pallets": fl_a_pal,
+                "Over route cap after pallets": rc_a_pal,
+                "Extra trucks needed after": extra,
                 "KG after": round(after["kg"].sum()),
                 "Pallets after": round(after["pal"].sum(), 1),
                 "Added km limit before": lim_b,
@@ -1044,6 +1098,9 @@ def summary_rows(label, res):
 def actual_route_rows(orders, coords, depot_xy):
     """Each real route (week, depot, day, route ID) measured as one closed straight-line loop.
 
+    Through each order's own postcode when orders has a "stop" column (postcodes.add_stops),
+    else through district centres.
+
     Week is in the key so a route ID reused in another week is a separate route.
     """
     rows = []
@@ -1052,13 +1109,19 @@ def actual_route_rows(orders, coords, depot_xy):
         if depot not in depot_xy:
             continue
         areas = sorted(set(g["area"]))
-        _, km, _, unlocated = vehicle_route(areas, coords, depot_xy[depot])
+        stops = sorted(set(g["stop"])) if "stop" in g.columns else areas
+        _, km, _, unlocated = vehicle_route(stops, coords, depot_xy[depot])
         kg, pal = g["kg"].sum(), g["pal"].sum()
         rows.append({"Week": wk, "Depot": depot, "Day": day, "Route": route,
                      "Type": "Van" if route_is_van(kg, pal) else "HGV",
                      "Areas": ", ".join(areas), "KG": round(kg), "Pallets": round(pal, 1),
-                     "Route km": round(km, 1), "Areas without grid ref": len(unlocated),
-                     "Drops": len(g),
+                     "Route km": round(km, 1), "Areas without grid ref": len({area_of(s) for s in unlocated}),
+                     "Drops": len(g),                       # every order is a drop
+                     "Delivery points": len(stops),
+                     "_stops": stops,                      # for the maps, not written out
+                     # vehicle type for fill: a van if the load fits one, else 18t, else 26t
+                     "_fill_type": ("Van" if route_is_van(kg, pal) else
+                                    "HGV" if order_fits_type(kg, pal, "HGV") else "26t"),
                      # area -> order lines on this route; used to pick comparators, not written out
                      "_area_drops": g["area"].value_counts().to_dict()})
     return rows
@@ -1100,8 +1163,8 @@ def route_km_summary(rows):
 
 
 def drops(v):
-    """Stops on a planned route: the order list minus the depot at each end."""
-    return max(len(v["Order"]) - 2, 0)
+    """Drops on a planned route: its orders."""
+    return v["Drops"]
 
 
 def pick_example_routes(vehicles, n_random=2, seed=1, min_drops=EXAMPLE_MIN_DROPS):
@@ -1237,7 +1300,8 @@ class MapFrame:
         Drawn from its own depot, which can differ from the map's depot for a comparator.
         """
         depot = r["Depot"] if r["Depot"] in self.depot_xy else self.depot
-        order = vehicle_route(sorted(split_areas(r["Areas"])), self.coords, self.depot_xy[depot])[0]
+        order = vehicle_route(r.get("_stops") or sorted(split_areas(r["Areas"])), self.coords,
+                              self.depot_xy[depot])[0]
         if not order:
             return
         xy = self.loop(order, ACTUAL_COLOUR, 0.9, 1, dashed=True, dot=8, depot=depot)
@@ -1322,7 +1386,7 @@ def date_tag(week, day):
 
 # ---- Main -----------------------------------------------------------------
 def main():
-    orders = load_orders(choose_orders_path())
+    orders = load_orders(choose_orders_path(), drop_cancelled=True)
     plan_source = choose_planning_source()
     plans = load_plan(plan_source)
     coords, depot_xy = load_grid_refs()
@@ -1330,6 +1394,17 @@ def main():
     missing = sorted(set(orders["area"]) - set(coords))
     if missing:
         print(f"Areas with no grid reference (never merged across, no route km): {missing}")
+    postcodes.add_stops(orders, coords, "Planning orders")
+
+    # Actual (before) figures and real routes: the raw orders file, ORDERS_PATH
+    if ORDERS_PATH and Path(ORDERS_PATH).is_file():
+        print(f"\nActual routes from the raw orders file (ORDERS_PATH): {ORDERS_PATH}")
+        raw_orders = load_orders(ORDERS_PATH, drop_cancelled=True)
+        postcodes.add_stops(raw_orders, coords, "Raw orders")
+    else:
+        print("ORDERS_PATH not set or not a file: actual routes and 'before' figures use the planning orders "
+              "(builder-consolidated), so real route counts may be low")
+        raw_orders = orders
 
     picks = pick_weeks(orders)
     band_of = {wk: band for band, wk in picks}
@@ -1337,7 +1412,7 @@ def main():
               "Routes": [], "Moves": [], "Overflow": [], "Checks": []}
     if ROUTE_DETAIL:
         tables["Route detail"] = []
-    actual = actual_route_rows(orders, coords, depot_xy)
+    actual = actual_route_rows(raw_orders, coords, depot_xy)
     tables["Actual route km"] = public(actual)
     tables["Actual route summary"] = route_km_summary(actual)
     ROUTE_CAP.update(route_caps(actual))
@@ -1350,7 +1425,7 @@ def main():
         wo = orders[orders["wk"] == wk]
         tables["Weeks"].append({"Band": band, "Week ID": wk,
                                 "KG": round(wo["kg"].sum()), "Routes": wo["route"].nunique()})
-        res = simulate(wk, wk, wo, plans, coords, depot_xy)
+        res = simulate(wk, wk, wo, plans, coords, depot_xy, extra_check=True)
         planned_vehicles += [v for v in res["Vehicles"] if v["Plan"] == "After" and v["Order"]]
         all_vehicles += res["Vehicles"]
         all_orders += res["Orders"]
@@ -1419,8 +1494,11 @@ def main():
 
     if SETTINGS["planning"]["customer_report"]:
         import customer_report
+        weeks = set(band_of)
         rep = customer_report.build(run_dir, RUN_STAMP, band_of, all_vehicles, pd.concat(all_orders),
-                                    tables["Daily"], orders, plan_source)
+                                    tables["Daily"], orders, plan_source,
+                                    actual_routes=[r for r in actual if r["Week"] in weeks],
+                                    actual_orders=raw_orders[raw_orders["wk"].isin(weeks)])
         print(f"Saved {rep}")
 
 
