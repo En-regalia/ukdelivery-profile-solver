@@ -12,6 +12,11 @@ For the lowest, median and peak network weeks (by kg):
     lets it absorb another route's orders (so one truck fewer), and the 26t fleet
     has room. Orders over 8t go straight onto 26t routes.
     Both truck types use the depot's real-route cap (90th percentile of actual HGV routes).
+- Comparator: each planned route is compared with ONE real route, taken whole as it ran
+  (real routes are never combined): the real route with the most drops in the planned
+  route's areas, provided more than half its drops are there (comparator_min_share).
+  Same week and day first, at any depot; then the same week on any day; else
+  "No comparable route". Shown on the Routes sheet and the example route maps.
   Route km is straight-line (depot -> stops -> depot), so it understates road
   distance. The ceilings apply to these straight-line km.
   FLEET_CAP is enforced: no depot-day uses more vans, 8t HGVs or 26ts than its fleet.
@@ -91,6 +96,9 @@ FLEET_CAP = fleet_caps()  # vehicles available per depot per day, by type; a dep
 MAX_ADDED_KM = SETTINGS["routes"]["max_added_km"]
 ADDED_KM_STEP = SETTINGS["routes"]["added_km_step"]
 ADDED_KM_CEILING = SETTINGS["routes"]["added_km_ceiling"]
+# Comparator: a planned route is compared with the one real route that has more than this
+# share of its drops in the planned route's areas (most such drops wins). Real routes are never combined.
+COMPARATOR_MIN_SHARE = SETTINGS["planning"].get("comparator_min_share", 0.5)
 ROUTE_DETAIL = SETTINGS["planning"]["route_detail"]   # writes a "Route detail" sheet: every stop, leg and cumulative km (After plan)
 PLANNED_COLOUR = "#1f5fa8"  # single planned route on the example maps
 ACTUAL_COLOUR = "#9a9a9a"   # actual routes, drawn behind the planned ones
@@ -912,7 +920,7 @@ def route_detail_rows(label, res, coords, depot_xy):
     return rows
 
 
-def route_rows(label, res):
+def route_rows(label, res, actual=()):
     daily = pd.DataFrame(res["Daily"])
     if daily.empty:
         return []
@@ -930,7 +938,8 @@ def route_rows(label, res):
                                  "Drops": int(r["Drops"]),
                                  "Route km": r["Route km"], "Stop km": r["Stop km"],
                                  "Over van 500 km": bool(r["Over van 500 km"]),
-                                 "Areas without grid ref": int(r["Areas without grid ref"])})
+                                 "Areas without grid ref": int(r["Areas without grid ref"]),
+                                 **comparator_fields(r, actual)})
             pn = pallets[(pallets["Depot"] == depot) & (pallets["Day"] == day)] if not pallets.empty else pallets
             rows.append({"Week": label, "Depot": depot, "Day": day, "Route": "Pallet Network",
                          "Type": "", "Weight": int(pn["KG"].sum()) if not pn.empty else 0,
@@ -1022,8 +1031,16 @@ def actual_route_rows(orders, coords, depot_xy):
         rows.append({"Week": wk, "Depot": depot, "Day": day, "Route": route,
                      "Type": "Van" if route_is_van(kg, pal) else "HGV",
                      "Areas": ", ".join(areas), "KG": round(kg), "Pallets": round(pal, 1),
-                     "Route km": round(km, 1), "Areas without grid ref": len(unlocated)})
+                     "Route km": round(km, 1), "Areas without grid ref": len(unlocated),
+                     "Drops": len(g),
+                     # area -> order lines on this route; used to pick comparators, not written out
+                     "_area_drops": g["area"].value_counts().to_dict()})
     return rows
+
+
+def public(rows):
+    """Rows without the internal "_" keys, for writing to Excel."""
+    return [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows]
 
 
 def route_caps(rows):
@@ -1094,16 +1111,54 @@ def split_areas(text):
     return {a for a in (text or "").split(", ") if a}
 
 
-def matching_actual_routes(v, actual):
-    """Actual routes on the same depot, day and week that served any of a planned route's areas.
+def comparator_route(v, actual):
+    """The one real route to compare a planned route with, or (None, "").
 
-    These are the real loads, not the same vehicle. An area the plan moved to another
-    day has no actual route on the planned day, so it finds no match here.
+    Real routes are taken whole, as they ran, and never combined. A real route qualifies
+    if more than COMPARATOR_MIN_SHARE of its drops (order lines) are in the planned
+    route's areas; its other drops stay on it. Of those, the one with the most drops in
+    the planned areas wins; a tie goes to the closest kg, then the route ID.
+    Search: same week and day first (any depot, as areas move depot), then the same
+    week on any day. Returns (route row, "Same day" or "Other day").
     """
     areas = split_areas(v["Areas"])
-    return [r for r in actual
-            if (r["Depot"], r["Day"], r["Week"]) == (v["Depot"], v["Day"], v["Week"])
-            and areas & split_areas(r["Areas"])]
+    if not areas:
+        return None, ""
+
+    def best(rows):
+        scored = []
+        for r in rows:
+            ad = r.get("_area_drops") or {}
+            total = sum(ad.values())
+            inside = sum(n for a, n in ad.items() if a in areas)
+            if total and inside / total > COMPARATOR_MIN_SHARE:
+                scored.append((-inside, abs(r["KG"] - v["KG"]), str(r["Route"]), r))
+        return min(scored, key=lambda t: t[:3])[3] if scored else None
+
+    week = [r for r in actual if r["Week"] == v["Week"]]
+    r = best([r for r in week if r["Day"] == v["Day"]])
+    if r is not None:
+        return r, "Same day"
+    r = best(week)
+    return (r, "Other day") if r is not None else (None, "")
+
+
+def comparator_fields(v, actual):
+    """Comparator columns for the Routes sheet."""
+    r, basis = comparator_route(v, actual)
+    if r is None:
+        return {"Comparator route": "No comparable route", "Comparator basis": "",
+                "Comparator depot": "", "Comparator day": "", "Comparator KG": None,
+                "Comparator pallets": None, "Comparator drops": None,
+                "Comparator drops in areas %": None, "Comparator route km": None}
+    areas = split_areas(v["Areas"])
+    ad = r["_area_drops"]
+    inside = sum(n for a, n in ad.items() if a in areas)
+    return {"Comparator route": r["Route"], "Comparator basis": basis,
+            "Comparator depot": r["Depot"], "Comparator day": r["Day"], "Comparator KG": r["KG"],
+            "Comparator pallets": r["Pallets"], "Comparator drops": r["Drops"],
+            "Comparator drops in areas %": round(100 * inside / r["Drops"]),
+            "Comparator route km": r["Route km"]}
 
 
 def fill_pct(kg, pal, vtypes):
@@ -1134,14 +1189,14 @@ class MapFrame:
             outline.plot(ax=self.ax, color="#dedede", edgecolor="white", linewidth=0.3)
         self.xs, self.ys = [], []
 
-    def to_xy(self, order):
+    def to_xy(self, order, depot=None):
         # coords are km; the outline is in metres (EPSG 27700), so convert here
-        d = self.depot_xy[self.depot]
+        d = self.depot_xy[depot or self.depot]
         return [(d[0] * 1000, d[1] * 1000) if node == DEPOT_KEY
                 else (self.coords[node][0] * 1000, self.coords[node][1] * 1000) for node in order]
 
-    def loop(self, order, colour, lw, z, label=None, dashed=False, dot=14):
-        xy = self.to_xy(order)
+    def loop(self, order, colour, lw, z, label=None, dashed=False, dot=14, depot=None):
+        xy = self.to_xy(order, depot)
         xs, ys = [p[0] for p in xy], [p[1] for p in xy]
         self.ax.plot(xs, ys, color=colour, linewidth=lw, linestyle="--" if dashed else "-",
                      zorder=z, label=label)
@@ -1151,11 +1206,15 @@ class MapFrame:
         return xy
 
     def actual(self, r, label=True):
-        """One actual route, grey and dashed, behind the planned routes (order from vehicle_route)."""
-        order = vehicle_route(sorted(split_areas(r["Areas"])), self.coords, self.depot_xy[self.depot])[0]
+        """One actual route, grey and dashed, behind the planned routes (order from vehicle_route).
+
+        Drawn from its own depot, which can differ from the map's depot for a comparator.
+        """
+        depot = r["Depot"] if r["Depot"] in self.depot_xy else self.depot
+        order = vehicle_route(sorted(split_areas(r["Areas"])), self.coords, self.depot_xy[depot])[0]
         if not order:
             return
-        xy = self.loop(order, ACTUAL_COLOUR, 0.9, 1, dashed=True, dot=8)
+        xy = self.loop(order, ACTUAL_COLOUR, 0.9, 1, dashed=True, dot=8, depot=depot)
         if label:
             # label at the stop furthest from the depot
             far = max(xy[1:-1], key=lambda p: (p[0] - xy[0][0]) ** 2 + (p[1] - xy[0][1]) ** 2)
@@ -1185,9 +1244,9 @@ class MapFrame:
 
 
 def draw_route_map(kind, v, coords, depot_xy, outline, out_png, actual_routes=()):
-    """One planned route (blue) with the actual routes that served its areas that day (grey, behind).
+    """One planned route (blue) with its comparator real route (grey, behind); see comparator_route.
 
-    Footer: planned against actual km, kg and fill.
+    Footer: planned against the comparator's km, kg and fill.
     """
     depot, order, km = v["Depot"], v["Order"], v["Route km"]
     if not order:
@@ -1196,7 +1255,8 @@ def draw_route_map(kind, v, coords, depot_xy, outline, out_png, actual_routes=()
     m = MapFrame(depot, coords, depot_xy, outline)
     if actual_routes:
         m.ax.plot([], [], color=ACTUAL_COLOUR, linestyle="--", linewidth=0.9,
-                  label=f"Actual, same day ({len(actual_routes)})")
+                  label="Actual: " + ", ".join(f"{r['Route']} ({r['Depot']} {r['Day'][:3]})"
+                                               for r in actual_routes))
     for r in actual_routes:
         m.actual(r)
     m.loop(order, PLANNED_COLOUR, 1.4, 3, label="Planned", dot=18)
@@ -1243,7 +1303,7 @@ def main():
     if ROUTE_DETAIL:
         tables["Route detail"] = []
     actual = actual_route_rows(orders, coords, depot_xy)
-    tables["Actual route km"] = actual
+    tables["Actual route km"] = public(actual)
     tables["Actual route summary"] = route_km_summary(actual)
     ROUTE_CAP.update(route_caps(actual))
     for row in tables["Actual route summary"]:
@@ -1263,7 +1323,7 @@ def main():
         km = {} if veh.empty else sum_route_km(veh, ["Plan"]).set_index("Plan")["Route km"].to_dict()
         tables["Weeks"][-1]["Route km before"] = round(km.get("Before", 0.0), 1)
         tables["Weeks"][-1]["Route km after"] = round(km.get("After", 0.0), 1)
-        tables["Routes"] += route_rows(wk, res)
+        tables["Routes"] += route_rows(wk, res, actual)
         if ROUTE_DETAIL:
             tables["Route detail"] += route_detail_rows(wk, res, coords, depot_xy)
         tables["Summary"] += summary_rows(wk, res)
@@ -1292,8 +1352,9 @@ def main():
         outline = load_uk_outline()
         for kind, v in example_routes:
             name = (f"{v['Depot']}_{v['Day']}_week_{v['Week']}_{v['Type']}_vehicle_{v['Vehicle']}_{kind}.png")
+            comp, _ = comparator_route(v, actual)
             png = draw_route_map(kind, v, coords, depot_xy, outline, example_dir / safe_name(name),
-                                 matching_actual_routes(v, actual))
+                                 [comp] if comp is not None else [])
         print(f"Days Maps Saved {png}")
 
         if DAY_MAPS:
