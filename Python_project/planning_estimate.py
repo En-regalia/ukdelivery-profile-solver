@@ -1300,8 +1300,10 @@ def main():
         example_dir.mkdir(parents=True, exist_ok=True)
         outline = load_uk_outline()
         for kind, v in example_routes:
+            depot_dir = example_dir / safe_name(v["Depot"])      # one folder per depot
+            depot_dir.mkdir(exist_ok=True)
             name = (f"{date_tag(v['Week'], v['Day'])}_{v['Depot']}_{v['Type']}_vehicle_{v['Vehicle']}_{kind}.png")
-            png = draw_route_map(kind, v, coords, depot_xy, outline, example_dir / safe_name(name),
+            png = draw_route_map(kind, v, coords, depot_xy, outline, depot_dir / safe_name(name),
                                  matching_actual_routes(v, actual))
         print(f"Days Maps Saved {png}")
 
@@ -1310,7 +1312,7 @@ def main():
             day_dir = run_dir / "Day maps"
             day_dir.mkdir(exist_ok=True)
             for depot, week in sorted({(v["Depot"], v["Week"]) for _, v in example_routes}):
-                day_dir_depot = run_dir / "Day maps"
+                day_dir_depot = day_dir / safe_name(depot)        # one folder per depot
                 day_dir_depot.mkdir(exist_ok=True)
                 for day in DAYS:
                     planned = [v for v in planned_vehicles
@@ -1319,7 +1321,7 @@ def main():
                         continue
                     act = [r for r in actual if (r["Depot"], r["Day"], r["Week"]) == (depot, day, week)]
                     png = draw_day_map(depot, day, week, planned, act, coords, depot_xy, outline,
-                                       day_dir / safe_name(f"{date_tag(week, day)}_{depot}.png"))
+                                       day_dir_depot / safe_name(f"{date_tag(week, day)}_{depot}.png"))
             print(f"Day maps Saved to: {day_dir}")
 
     out = run_dir / f"Example_weeks_{RUN_STAMP}.xlsx"
