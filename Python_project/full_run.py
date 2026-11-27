@@ -26,6 +26,34 @@ def step(title, fn):
     fn()                           # an exception or SystemExit stops the run here
 
 
+def sweep_newest_anneal():
+    """Step 4 without the "Enter the number to use" prompt: the sweep takes the newest anneal run.
+
+    Step 3 has just written its Run_<stamp> folder, so the newest run is that one.
+    planning_estimate.AUTO is switched on for the sweep only and put back afterwards,
+    so step 5 still asks as it does now (settings.toml [planning] auto decides there).
+    """
+    expected = anneal_regional.OUTPUT_DIR / f"Run_{anneal_regional.RUN_STAMP}"   # folder step 3 wrote
+    saved_auto = planning_estimate.AUTO
+    saved_choose = planning_estimate.choose_plan_source
+
+    def choose_newest():
+        chosen = saved_choose()    # lists the 5 newest runs, then takes the newest (AUTO is on)
+        print(f"Sweep auto-picked anneal run: {chosen}")
+        if chosen != expected:
+            print(f"WARNING: this is not the run step 3 just made ({expected}). "
+                  "Check the anneal output folder before using the sweep results.")
+        return chosen
+
+    planning_estimate.AUTO = True
+    planning_estimate.choose_plan_source = choose_newest
+    try:
+        sweep_plan.main()
+    finally:
+        planning_estimate.AUTO = saved_auto
+        planning_estimate.choose_plan_source = saved_choose
+
+
 if ask_skip(5):
     print("Depot assignment/Anneal Skipped.")
 else:
@@ -38,5 +66,5 @@ if not matrix_common.MATRIX_PATH.exists():
 print(f"\nUsing matrix for all steps: {matrix_common.MATRIX_PATH}")
 
 step("3. Anneal", anneal_regional.main)
-step("4. Sweep", sweep_plan.main)
+step("4. Sweep", sweep_newest_anneal)
 step("5. Planning estimate", planning_estimate.main) 
