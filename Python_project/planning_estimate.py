@@ -114,13 +114,25 @@ def ask_path(prompt):
     # Strip the quotes Windows adds when you copy a path
     return Path(input(prompt).strip().strip('"').strip("'"))
 
+PLAN_GLOB = "Anneal_*_Regional_*.xlsx"   # anneal and sweep plan files (sweep: Anneal_*_Regional_Sweep_*)
+
+
 def choose_run(folder, title):
-    """Pick one of the five most recent runs in folder (Run_ subfolders or files saved directly)."""
-    runs = [d for d in folder.iterdir() if d.is_dir() and d.name.startswith("Run_")]
-    if any(folder.glob("Anneal_*_Regional_*.xlsx")):
+    """Pick one of the five most recent runs in folder (Run_ subfolders or files saved directly).
+
+    Run_ folders holding no plan file (a run stopped early, or one that planned no depots)
+    are skipped and named, so they cannot be picked and send every area to the pallet network.
+    """
+    found = [d for d in folder.iterdir() if d.is_dir() and d.name.startswith("Run_")]
+    runs = [d for d in found if any(d.glob(PLAN_GLOB))]
+    empty = sorted(d.name for d in found if d not in runs)
+    if empty:
+        print(f"Skipped {len(empty)} {title} run folder(s) with no {PLAN_GLOB} file: {', '.join(empty[-5:])}"
+              + (" ..." if len(empty) > 5 else ""))
+    if any(folder.glob(PLAN_GLOB)):
         runs.append(folder)                # single-depot runs save straight into this folder
     if not runs:
-        raise SystemExit(f"No {title} runs found in {folder}")
+        raise SystemExit(f"No {title} runs with a {PLAN_GLOB} file found in {folder}")
     runs = sorted(runs, key=lambda d: d.stat().st_mtime, reverse=True)[:5]
     print(f"\nMost recent {title} runs:")
     for i, d in enumerate(runs, start=1):
@@ -256,7 +268,11 @@ def load_plan(source):
     source is a folder of Anneal_*_Regional_*.xlsx files, or one such file.
     """
     source = Path(source)
-    files = [source] if source.is_file() else sorted(source.glob("Anneal_*_Regional_*.xlsx"))
+    files = [source] if source.is_file() else sorted(source.glob(PLAN_GLOB))
+    if not files:
+        raise SystemExit(f"No plan files ({PLAN_GLOB}) in {source}\n"
+                         "Without a plan every order would go to the pallet network. "
+                         "Pick a run folder that holds the anneal or sweep workbooks.")
     plans = {}
     for f in files:
         depot = str(pd.read_excel(f, sheet_name="Summary").loc[0, "Depot"]).strip()
@@ -767,7 +783,17 @@ def simulate(label, wk, wo, plans, coords, depot_xy):
                           "Weekend kg (not simulated)": round(wo.loc[~wo["day"].isin(DAYS), "kg"].sum())})
 
     area_dep = area_depots(plans)
-    weekday["new_depot"] = weekday["area"].map(area_dep).fillna(PALLET)
+    weekday["new_depot"] = [area_dep.get(a, PALLET) for a in weekday["area"]]
+    if len(weekday) and not (weekday["new_depot"] != PALLET).any():
+        order_areas = sorted(set(weekday["area"]))[:10]
+        plan_areas = sorted(area_dep)[:10]
+        raise SystemExit(f"{label}: no postcode area in the orders matches any area in the plan, "
+                         f"so every order would go to the pallet network.\n"
+                         f"  Orders areas (first 10): {order_areas}\n"
+                         f"  Plan areas (first 10):   {plan_areas}\n"
+                         f"  Plan depots: {sorted(plans) or 'none'}\n"
+                         "Check the plan run folder and that the orders file's area column "
+                         "(column AN) holds postcode districts in the same format as the plan.")
     unmatched = sorted(set(weekday.loc[weekday["new_depot"] == PALLET, "area"]))
     if unmatched:
         print(f"{label}: {len(unmatched)} areas in no plan, sent to pallet network: {unmatched}")
