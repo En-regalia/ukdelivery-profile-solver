@@ -30,13 +30,13 @@ if ask_skip(5):
     print("Depot assignment/Anneal Skipped.")
 else:
     step("1. Depot assignment", Matrix.assign_depot.main)
-    step("2. Build matrix", Matrix.build_matrix.main)
 
-    if not matrix_common.MATRIX_PATH.exists():
-        raise SystemExit(f"Matrix not found: {matrix_common.MATRIX_PATH}")
-    print(f"\nUsing matrix for all steps: {matrix_common.MATRIX_PATH}")
+step("2. Build matrix", Matrix.build_matrix.main)
 
-    step("3. Anneal", anneal_regional.main)
+if not matrix_common.MATRIX_PATH.exists():
+    raise SystemExit(f"Matrix not found: {matrix_common.MATRIX_PATH}")
+print(f"\nUsing matrix for all steps: {matrix_common.MATRIX_PATH}")
 
+step("3. Anneal", anneal_regional.main)
 step("4. Sweep", sweep_plan.main)
-step("5. Planning estimate", planning_estimate.main)
+step("5. Planning estimate", planning_estimate.main) 
