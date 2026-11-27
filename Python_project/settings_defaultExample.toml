@@ -219,15 +219,15 @@ preferred_bonus_km = 15
 depot = ""                  # one depot name to run only that depot, or "" for every active depot
 remote_km = 150.0           # letters further than this from the depot's main body...
 min_districts = 2           # ...and with fewer weighted districts than this are treated as external
-group_size = 2              # about this many letter zones per group
+group_size = 1              # about this many letter zones per group
 peak_tolerance = 0.03       # the busiest day may rise this far above the current busiest day (0.03 = 3%)
 peak_penalty = 500.0        # km added per 100% of peak above that limit
-peak_cost_km = 1000.0       # km of day radius a 100% peak reduction is worth (0 = ignore)
+peak_cost_km = 100.0       # km of day radius a 100% peak reduction is worth (0 = ignore)
 spread_tolerance = 0.05     # busiest minus quietest day, as a share of the average day
 spread_penalty = 1000.0     # km added per 100% of spread above the tolerance
-spacing_days_km = 5.0       # km per unit of uneven spacing between a group's delivery days (0 = ignore)
+spacing_days_km = 4.0       # km per unit of uneven spacing between a group's delivery days (0 = ignore)
 spacing_ideal_gap = 2       # ideal gap in days between deliveries (2 = every other day)
-day_loss_km = 10.0          # km cost per day short of a full week, averaged over kg
+day_loss_km = 5.0          # km cost per day short of a full week, averaged over kg
 isolation_km = 0            # districts averaging over this many km to neighbours are excluded (0 = use the percentile below)
 percentile = 98             # isolation percentile, used when isolation_km is 0
 max_copy_km = 15.0          # zero-volume districts further than this from a weighted one get no days
