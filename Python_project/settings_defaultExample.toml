@@ -279,6 +279,7 @@ route_detail = true         # write the "Route detail" sheet (every stop of ever
 example_min_drops = 4       # example maps only use routes with at least this many drops
 day_maps = true             # draw a full-day map per depot and day for the example weeks
 customer_report = true      # write the customer reporting workbook
+comparator_min_share = 0.5  # a planned route is compared with the one real route that has more than this share of its drops in the planned areas
 
 
 # -------------------------------------------------------------------------------------
