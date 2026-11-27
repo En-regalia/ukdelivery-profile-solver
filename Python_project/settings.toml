@@ -129,7 +129,9 @@ method = "preference"
 # A depot can "reasonably reach" an area when both hold:
 #   - the closed loop depot -> area -> depot fits within the depot's route cap (max_route_km, the cap from
 #     the orders file, or [assignment.route_cap_km]), and
-#   - the depot is no more than reach_ratio times as far as the area's nearest depot.
+#   - the depot is no more than reach_ratio times as far as the area's nearest depot (Bristol, the cover
+#     depot, is left out of this comparison, so being close to Bristol does not stop Watford), and
+#   - the depot's vehicles would not be driving past Bristol to get there (past_cover_km below).
 # Order: 1. preferred_depot takes every area it can reach, nearest to it first, up to its max_fleet.
 #        2. The other depots (not the cover depot) take what is left, each area going to its nearest
 #           depot that can reach it, nearest first, up to their max_fleet. An area over a full depot
@@ -140,6 +142,13 @@ method = "preference"
 preferred_depot = "Watford"
 cover_depot = "Bristol Outbase"
 reach_ratio = 2.0
+# "Driving past Bristol": an area stays with Bristol when going depot -> Bristol -> area is at most this
+# many km longer than going straight depot -> area (straight-line km). Bigger = Bristol keeps more.
+# 35 keeps BS, Wales, Devon, Cornwall, most of TA and the Forest of Dean; BA, most GL, SN, DT, HR, WR go to Watford.
+past_cover_km = 35
+# Areas always kept by Bristol, whatever the tests say: exact areas ("TQ6") or whole letters ("CF").
+# These are edge districts the straight-line test gets wrong.
+cover_always = ["EX13", "TQ4", "TQ6", "TA11", "TA18"]
 
 # Final step (every method): a map of each depot and the postcode areas it covers, current depots beside
 # the new assignment. Saved as Depot_coverage_map_<run>.png and on a "Map" sheet in the workbook.

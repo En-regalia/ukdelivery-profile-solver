@@ -4,7 +4,11 @@ Three methods (settings.toml [assignment] method):
 
 "preference" (default): Watford first. Bristol only covers what Watford cannot reasonably do.
   A depot can reasonably reach an area when the closed loop depot -> area -> depot fits within its
-  route cap, and it is no more than REACH_RATIO times as far as the area's nearest depot.
+  route cap, it is no more than REACH_RATIO times as far as the area's nearest depot (the cover
+  depot is left out of that comparison), and its vehicles would not be driving past the cover depot
+  to get there. "Driving past" (PAST_COVER_KM): going depot -> cover depot -> area is at most
+  PAST_COVER_KM longer than going straight depot -> area, so the area lies beyond Bristol as seen
+  from that depot. Areas in COVER_ALWAYS always stay with the cover depot.
   1. PREFERRED_DEPOT (Watford) takes every area it can reach, nearest to it first, up to its
      MAX_FLEET capacity.
   2. The other depots except the cover depot (Warrington, Doncaster) take what is left: each area
@@ -104,6 +108,8 @@ PALLET_COL = S.get("pallet_col", "").strip()  # pallets column in the orders fil
 PREFERRED_DEPOT = S.get("preferred_depot", "Watford")         # takes every area it can reasonably reach first
 COVER_DEPOT = S.get("cover_depot", "Bristol Outbase")         # only keeps or takes what no other depot can reach
 REACH_RATIO = S.get("reach_ratio", 2.0)                       # at most this many times the nearest depot's km
+PAST_COVER_KM = S.get("past_cover_km", 35.0)                  # "driving past Bristol" detour limit, km
+COVER_ALWAYS = [str(a).strip().upper() for a in S.get("cover_always", [])]  # areas or letters always Bristol
 MAX_FLEET = {d: dict(v) for d, v in S.get("max_fleet", {}).items()}   # depot -> {type: vehicles}, the ceiling
 FILL_TARGET = SETTINGS["report"]["fill_target"]               # each max_fleet vehicle counts at this fill
 MAKE_MAP = S.get("make_map", True)                            # draw the depot coverage map at the end
@@ -511,7 +517,27 @@ def preference_stage(helper, depot_xy, volume, check_pallets=True):
         for k, n in enumerate(names):
             loop[i, k] = vehicle_route([areas[i]], axy, (dep[k, 0] / 1000, dep[k, 1] / 1000))[1]
     caps_km = np.array([route_cap(n) for n in names])
-    reach = (loop <= caps_km[None, :]) & (dist <= REACH_RATIO * d1[:, None] + 1e-9) & ~no_grid[:, None]
+
+    # Reach ratio against the nearest depot other than the cover depot, so being close to Bristol
+    # no longer stops Watford reaching an area. The "driving past Bristol" test does that job instead.
+    not_c = [k for k in range(len(names)) if k != C]
+    d1_not_c = dist[:, not_c].min(axis=1)
+    ratio_ok = dist <= REACH_RATIO * d1_not_c[:, None] + 1e-9
+
+    # Driving past Bristol: depot -> Bristol -> area is at most PAST_COVER_KM longer than depot -> area.
+    depot_to_c = np.hypot(dep[:, 0] - dep[C, 0], dep[:, 1] - dep[C, 1]) / 1000   # km, each depot to Bristol
+    detour = depot_to_c[None, :] + dist[:, [C]] - dist                          # km, area x depot
+    past_c = detour <= PAST_COVER_KM
+    past_c[:, C] = False                                                         # Bristol never drives past itself
+
+    # Areas always kept by Bristol: an exact area ("TQ6") or a whole letter group ("CF").
+    letters = pd.Series(areas).astype(str).str.upper().str.extract(r"^([A-Z]+)")[0].fillna("").to_numpy()
+    always_c = np.array([(str(a).upper() in COVER_ALWAYS) or (l in COVER_ALWAYS)
+                         for a, l in zip(areas, letters)])
+
+    reach = (loop <= caps_km[None, :]) & ratio_ok & ~past_c & ~no_grid[:, None]
+    reach[always_c, :] = False
+    reach[always_c, C] = ~no_grid[always_c]            # only Bristol can reach a cover_always area
 
     t = pd.DataFrame({
         AREA: areas,
@@ -524,6 +550,8 @@ def preference_stage(helper, depot_xy, volume, check_pallets=True):
         f"Km to {PREFERRED_DEPOT}": dist[:, P].round(1),
         f"{PREFERRED_DEPOT} loop km": loop[:, P].round(1),
         f"{PREFERRED_DEPOT} can reach": reach[:, P],
+        f"{PREFERRED_DEPOT} detour via {COVER_DEPOT} km": detour[:, P].round(1),
+        f"Past {COVER_DEPOT} for {PREFERRED_DEPOT}": past_c[:, P] | always_c,
         "Depots that can reach": [", ".join(names[k] for k in order[i] if reach[i, k]) for i in rows_i],
     })
     t["kg per day"] = volume.reindex(t[AREA])["kg"].fillna(0).round(1).to_numpy()
@@ -583,7 +611,10 @@ def preference_stage(helper, depot_xy, volume, check_pallets=True):
     for i in sorted((i for i in rows_i if not placed(i) and reach[i, C]),
                     key=lambda i: (dist[i, C], areas[i])):
         could = [names[k] for k in [P] + others if reach[i, k]]
-        why = (f"{', '.join(could)} full" if could else f"no other depot can reach it")
+        why = (f"{', '.join(could)} full" if could
+               else "on the cover_always list" if always_c[i]
+               else f"{PREFERRED_DEPOT} would drive past {COVER_DEPOT}" if past_c[i, P]
+               else "no other depot can reach it")
         over = not fits(i, C)
         place(i, C, f"3 {COVER_DEPOT} cover", R_COVER,
               f"{COVER_DEPOT} cover ({why})" + (f", over {COVER_DEPOT} capacity" if over else ""))
@@ -596,7 +627,8 @@ def preference_stage(helper, depot_xy, volume, check_pallets=True):
             continue
         k = near[i]
         place(i, k, "4 fallback to nearest", R_OUT_OF_REACH,
-              f"Fallback (no depot can reach it within its route cap and {REACH_RATIO}x the nearest): "
+              f"Fallback (no depot can reach it within its route cap, {REACH_RATIO}x the nearest "
+              f"and without driving past {COVER_DEPOT}): "
               "may need pallet network")
     t.loc[no_grid, "Reason"] = R_NO_GRID
     t.loc[no_grid, "Flag"] = "No depot: no grid reference"
@@ -634,8 +666,8 @@ def check_preference(t):
     rows = []
     by_rule = t[t["Rule"].str[:1].isin(["1", "2", "3"])]
     bad = [a for i, a, d in zip(by_rule.index, by_rule[AREA], by_rule[DEPOT]) if not reach[i, k_of[d]]]
-    rows.append({"Check": f"Areas placed by rules 1 to 3 are within their depot's route cap and {REACH_RATIO}x "
-                          "the nearest depot's km",
+    rows.append({"Check": f"Areas placed by rules 1 to 3 are within their depot's route cap, {REACH_RATIO}x "
+                          f"the nearest depot's km, and not past {COVER_DEPOT}",
                  "Result": "Pass" if not bad else "FAIL", "Detail": ", ".join(bad) or f"{len(by_rule)} areas"})
     at_p = t[t[DEPOT] == PREFERRED_DEPOT]
     strays = at_p[~at_p[f"{PREFERRED_DEPOT} can reach"]]
@@ -755,7 +787,9 @@ def settings_rows(depot_xy, check_pallets):
     ] + ([
         {"Setting": "Preferred depot", "Value": PREFERRED_DEPOT},
         {"Setting": "Cover depot", "Value": COVER_DEPOT},
-        {"Setting": "Reach ratio", "Value": REACH_RATIO},
+        {"Setting": "Reach ratio", "Value": f"{REACH_RATIO} (nearest depot other than {COVER_DEPOT})"},
+        {"Setting": f"Driving past {COVER_DEPOT} (past_cover_km)", "Value": PAST_COVER_KM},
+        {"Setting": f"Always {COVER_DEPOT} (cover_always)", "Value": ", ".join(COVER_ALWAYS) or "none"},
         {"Setting": "Max fleet", "Value": "; ".join(f"{d} " + ", ".join(f"{t} {n}" for t, n in f.items())
                                                     for d, f in MAX_FLEET.items()) or "none"},
         {"Setting": "Max fleet vehicles count at", "Value": f"{FILL_TARGET:.0%} fill ([report] fill_target)"},
