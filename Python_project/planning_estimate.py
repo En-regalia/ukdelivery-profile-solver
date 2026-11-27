@@ -1311,6 +1311,15 @@ def safe_name(name):
     return name.replace(" ", "_").replace("/", "_")
 
 
+def date_tag(week, day):
+    """Sortable start for a map file name, e.g. 2026-W42_1-Mon.
+
+    Week first, then day number, so Windows lists the maps in date order
+    (all of week 42, Monday to Friday, then week 43) instead of by depot or day name.
+    """
+    return f"{week}_{DAYS.index(day) + 1}-{day[:3]}"
+
+
 # ---- Main -----------------------------------------------------------------
 def main():
     orders = load_orders(choose_orders_path())
@@ -1377,10 +1386,11 @@ def main():
         example_dir.mkdir(parents=True, exist_ok=True)
         outline = load_uk_outline()
         for kind, v in example_routes:
-            name = (f"{v['Depot']}_{v['Day']}_week_{v['Week']}_{v['Type']}_vehicle_{v['Vehicle']}_{kind}.png")
-            comp, _ = comparator_route(v, actual)
-            png = draw_route_map(kind, v, coords, depot_xy, outline, example_dir / safe_name(name),
-                                 [comp] if comp is not None else [])
+            depot_dir = example_dir / safe_name(v["Depot"])      # one folder per depot
+            depot_dir.mkdir(exist_ok=True)
+            name = (f"{date_tag(v['Week'], v['Day'])}_{v['Depot']}_{v['Type']}_vehicle_{v['Vehicle']}_{kind}.png")
+            png = draw_route_map(kind, v, coords, depot_xy, outline, depot_dir / safe_name(name),
+                                 matching_actual_routes(v, actual))
         print(f"Days Maps Saved {png}")
 
         if DAY_MAPS:
@@ -1388,7 +1398,7 @@ def main():
             day_dir = run_dir / "Day maps"
             day_dir.mkdir(exist_ok=True)
             for depot, week in sorted({(v["Depot"], v["Week"]) for _, v in example_routes}):
-                day_dir_depot = run_dir / "Day maps"
+                day_dir_depot = day_dir / safe_name(depot)        # one folder per depot
                 day_dir_depot.mkdir(exist_ok=True)
                 for day in DAYS:
                     planned = [v for v in planned_vehicles
@@ -1397,7 +1407,7 @@ def main():
                         continue
                     act = [r for r in actual if (r["Depot"], r["Day"], r["Week"]) == (depot, day, week)]
                     png = draw_day_map(depot, day, week, planned, act, coords, depot_xy, outline,
-                                       day_dir / safe_name(f"{depot}_{DAYS.index(day) + 1}_{day}_week_{week}.png"))
+                                       day_dir_depot / safe_name(f"{date_tag(week, day)}_{depot}.png"))
             print(f"Day maps Saved to: {day_dir}")
 
     out = run_dir / f"Example_weeks_{RUN_STAMP}.xlsx"
