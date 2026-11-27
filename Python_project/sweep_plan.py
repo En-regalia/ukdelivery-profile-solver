@@ -63,7 +63,7 @@ KM_W = SW["km_w"]
 MAKE_MAPS = SW["make_maps"]
 
 HGV = PE.VEHICLE_TYPES["HGV"]   # 18t truck: the sweep's vehicle proxy
-# The proxy treats every vehicle as an 8t truck, so the cap is HGV + 26t fleet (vans left out)
+# The proxy treats every vehicle as an 18t truck, so the cap is HGV + 26t fleet (vans left out)
 TRUCK_CAP = {d: fl.get("HGV", 0) + fl.get("26t", 0) for d, fl in PE.FLEET_CAP.items()}
 
 def _day_map(pattern):

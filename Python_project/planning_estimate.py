@@ -7,10 +7,10 @@ For the lowest, median and peak network weeks (by kg):
   Outliers and external letters go to "Pallet network" with no vehicles.
 - Vehicles, packed per depot per day, within the depot's fleet:
     Van: 1000 kg / 5 pallets, route ceiling 500 km (hard).
-    HGV (8t): 8000 kg / 15 pallets. Routes are built at this size first.
+    HGV (18t): 8000 kg / 15 pallets. Routes are built at this size first.
     26t: 12000 kg / 20 pallets. A route is upgraded from HGV to 26t only when that
     lets it absorb another route's orders (so one truck fewer), and the 26t fleet
-    has room. Orders over 8t go straight onto 26t routes.
+    has room. Orders too big for an 18t go straight onto 26t routes.
     Both truck types use the depot's real-route cap (90th percentile of actual HGV routes).
 - Comparator: each planned route is compared with ONE real route, taken whole as it ran
   (real routes are never combined): the real route with the most drops in the planned
@@ -19,7 +19,7 @@ For the lowest, median and peak network weeks (by kg):
   "No comparable route". Shown on the Routes sheet and the example route maps.
   Route km is straight-line (depot -> stops -> depot), so it understates road
   distance. The ceilings apply to these straight-line km.
-  FLEET_CAP is enforced: no depot-day uses more vans, 8t HGVs or 26ts than its fleet.
+  FLEET_CAP is enforced: no depot-day uses more vans, 18t HGVs or 26ts than its fleet.
   Any order that cannot be placed within a route ceiling or the fleet goes to the
   pallet network (the "Overflow" sheet), with its reason: "route cap", "fleet", or
   "too big" (over 26t limits; counted with the route cap orders).
@@ -30,11 +30,11 @@ For the lowest, median and peak network weeks (by kg):
   Orders no van can take go to the trucks.
 
   Truck steps:
-  1. Pack the orders onto 8t routes by postcode area (first fit, largest orders first),
-     within the route cap. Orders over 8t go to 26t routes instead.
-  2. Consolidate: empty a route into the others. A route that can't take an order at 8t
+  1. Pack the orders onto 18t routes by postcode area (first fit, largest orders first),
+     within the route cap. Orders too big for an 18t go to 26t routes instead.
+  2. Consolidate: empty a route into the others. A route that can't take an order at 18t
      is upgraded to 26t if the 26t fleet has room. Repeat until no route can be emptied.
-  3. Fleet: if there are still more 26t or 8t routes than the fleet allows, the routes
+  3. Fleet: if there are still more 26t or 18t routes than the fleet allows, the routes
      carrying the most orders are kept and the rest of their orders are placed into them
      where they fit within the cap. Whatever cannot be placed is the fleet overflow.
   A new truck is only opened for an order whose own closed loop is within the cap.
@@ -50,7 +50,7 @@ is like for like.
 Actual routes are typed as vans when the whole route fits a van (under 1000 kg
 and 5 pallets, as on the vehicle-type rule), otherwise as HGV routes (26t routes
 are not split out of the actual data). The truck route cap comes from the 90th
-percentile of actual HGV routes per depot, and is used for both 8t and 26t.
+percentile of actual HGV routes per depot, and is used for both 18t and 26t.
 
 Route km (added): each packed vehicle's straight-line closed loop, depot -> stops
 -> depot, from routing.py (nearest neighbour then 2-opt). Route km includes both
@@ -330,7 +330,7 @@ def pick_weeks(o):
 # ---- Vehicle types ----------------------------------------------------------
 # A vehicle is {"type": "HGV", "26t" or "Van", "kg": float, "pal": float, "items": [(area, kg, pal), ...]}.
 # Items are whole orders, so an order is never split between vehicles.
-# A truck starts as "HGV" (8t) and becomes "26t" only when an upgrade is needed (see take).
+# A truck starts as "HGV" (18t) and becomes "26t" only when an upgrade is needed (see take).
 
 def order_fits_type(kg, pal, vtype):
     """True if one order fits an empty vehicle of this type."""
@@ -391,7 +391,7 @@ def copy_vehicle(v):
 
 
 def can_take(v, kg, pal, trucks, lim26):
-    """True if truck v can take the order as it is, or as a 26t upgrade of an 8t route.
+    """True if truck v can take the order as it is, or as a 26t upgrade of an 18t route.
 
     An upgrade needs room in the 26t fleet: fewer 26t trucks in `trucks` than lim26
     (None = no limit). trucks is the set of trucks in the plan being built.
@@ -407,7 +407,7 @@ def can_take(v, kg, pal, trucks, lim26):
 
 
 def take(v, item):
-    """Add an order to a truck, upgrading an 8t route to 26t if its load now needs it."""
+    """Add an order to a truck, upgrading an 18t route to 26t if its load now needs it."""
     add_item(v, item)
     h8 = VEHICLE_TYPES["HGV"]
     if v["type"] == "HGV" and (v["kg"] > h8["kg"] or v["pal"] > h8["pallets"]):
@@ -475,7 +475,7 @@ def select_van_loads(eligible, n_vans, route_km, cap, limit=None):
 def place(orders, route_km, cap, vtype="HGV"):
     """Pack orders into vehicles of one size with no fleet limit, first fit within each postcode area.
 
-    vtype: the route size, "HGV" (8t) or "26t". cap: hard route km ceiling. A new route is
+    vtype: the route size, "HGV" (18t) or "26t". cap: hard route km ceiling. A new route is
     only opened for an order whose own closed loop is within cap, so a single far-away stop
     cannot start a route over the ceiling. Orders must already fit an empty vehicle of vtype.
     Returns (vehicles, orders blocked by the route cap as (area, kg, pal) tuples).
@@ -550,7 +550,7 @@ def consolidate_trucks(trucks, coords, route_km, cap, lim26, limit=None):
 
     Smallest trucks are emptied first, and their orders largest first. Each order goes
     to the truck where the closed route adds the fewest km, and at most `limit` km. A truck that can't take an
-    order at 8t is upgraded to 26t if the 26t fleet has room (see can_take). A truck is
+    order at 18t is upgraded to 26t if the 26t fleet has room (see can_take). A truck is
     removed only if every one of its orders is placed. Repeats until no truck can be emptied.
     """
     changed = True
@@ -591,8 +591,8 @@ def consolidate_trucks(trucks, coords, route_km, cap, lim26, limit=None):
 def fit_fleet(trucks, fleet, route_km, cap):
     """Trim trucks to the fleet. Returns (kept trucks, fleet overflow as (area, kg, pal) tuples).
 
-    26t trucks over the 26t fleet are dropped first, then 8t trucks over the 8t fleet.
-    A dropped truck's orders go into the kept trucks where they fit within the cap (an 8t
+    26t trucks over the 26t fleet are dropped first, then 18t trucks over the 18t fleet.
+    A dropped truck's orders go into the kept trucks where they fit within the cap (an 18t
     kept truck may be upgraded only if the 26t fleet has room). The truck with the fewest
     orders is dropped first. Orders that still cannot be placed are the fleet overflow.
     """
@@ -633,7 +633,7 @@ def fit_fleet(trucks, fleet, route_km, cap):
 
 
 def over_fleet(trucks, fleet):
-    """True if there are more 8t or 26t trucks than the depot's fleet allows."""
+    """True if there are more 18t or 26t trucks than the depot's fleet allows."""
     _, n8, n26 = type_counts(trucks)
     return ((fleet["HGV"] is not None and n8 > fleet["HGV"])
             or (fleet["26t"] is not None and n26 > fleet["26t"]))
@@ -670,9 +670,9 @@ def pack_at(orders, coords, route_km, caps, fleet, limit):
 
     1. Van-eligible orders: select as many as possible onto the van fleet, with each
        van's route within 500 km.
-    2. Everything else is packed onto 8t routes by area within the cap. Orders over 8t
+    2. Everything else is packed onto 18t routes by area within the cap. Orders too big for an 18t
        go onto 26t routes. Orders over 26t limits are "too big".
-    3. Consolidation empties trucks into others. A truck that cannot take an order at 8t
+    3. Consolidation empties trucks into others. A truck that cannot take an order at 18t
        is upgraded to 26t if the 26t fleet has room (consolidate_trucks).
     4. Trucks are trimmed to the fleet (fit_fleet). Orders that still do not fit are
        fleet overflow.
@@ -705,7 +705,7 @@ def pack_at(orders, coords, route_km, caps, fleet, limit):
 
 def vehicle_rows(week, depot, day, plan, vehicles, coords, depot_xy):
     rows = []
-    # trucks listed first (26t, then 8t), then vans, each by weight
+    # trucks listed first (26t, then 18t), then vans, each by weight
     for i, v in enumerate(sorted(vehicles, key=lambda v: (v["type"] == "Van", v["type"] != "26t", -v["kg"])), start=1):
         areas = areas_of(v)
         order, km, stop_km, unlocated = vehicle_route(areas, coords, depot_xy)
@@ -740,7 +740,7 @@ def target_day(row, plan_new, pallet_areas, cache):
 
 
 def type_counts(vehicles):
-    """(vans, 8t HGVs, 26ts) in a list of vehicle dicts."""
+    """(vans, 18t HGVs, 26ts) in a list of vehicle dicts."""
     vans = sum(1 for v in vehicles if v["type"] == "Van")
     t26 = sum(1 for v in vehicles if v["type"] == "26t")
     return vans, len(vehicles) - vans - t26, t26
@@ -1107,7 +1107,7 @@ def drops(v):
 def pick_example_routes(vehicles, n_random=2, seed=1, min_drops=EXAMPLE_MIN_DROPS):
     """Per depot and vehicle type: the longest planned route, then n_random others (seeded).
 
-    Vans, 8t HGVs and 26ts are sampled separately, so one type cannot crowd out the others.
+    Vans, 18t HGVs and 26ts are sampled separately, so one type cannot crowd out the others.
     Only routes with more than 3 drops (min_drops = 4) are considered, so the examples
     show multi-stop routes rather than single long runs. A depot and type with no
     such route falls back to all its routes.

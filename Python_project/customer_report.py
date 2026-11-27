@@ -38,7 +38,7 @@ BANDS = ["Bottom 10", "Middle 10", "Top 10"]
 ALL = "All depots"
 TYPES = ["Van", "HGV", "26t"]
 TRUCKS = ["HGV", "26t"]
-TYPE_NAME = {"Van": "Vans", "HGV": "8t HGVs", "26t": "26t HGVs"}
+TYPE_NAME = {"Van": "Vans", "HGV": "18t HGVs", "26t": "26t HGVs"}
 FILL_TARGET = R["fill_target"]
 
 
@@ -639,7 +639,7 @@ def build(run_dir, stamp, band_of, vehicles, orders_sim, daily, orders_all, plan
     # ---- 4. Vehicle mix ----
     s = Sheet(wb, "Vehicle mix", tab="1F4E79")
     s.title("Vans and HGVs per depot, before and after")
-    s.text("Average per week in each band. 8t HGVs are upgraded to 26t only when that saves a truck.", italic=True)
+    s.text("Average per week in each band. 18t HGVs are upgraded to 26t only when that saves a truck.", italic=True)
     s.gap()
     s.table(vehicle_mix(V, band_of))
     sizes, size_sum = size_table(O, drops, n_weeks)
