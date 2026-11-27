@@ -9,3 +9,4 @@ matplotlib
 pillow 
 geopandas
 tomli; python_version < "3.11"
+shapely>=2.0

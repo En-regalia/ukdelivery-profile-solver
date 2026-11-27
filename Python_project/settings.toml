@@ -153,6 +153,9 @@ cover_always = ["EX13", "TQ4", "TQ6", "TA11", "TA18"]
 # Final step (every method): a map of each depot and the postcode areas it covers, current depots beside
 # the new assignment. Saved as Depot_coverage_map_<run>.png and on a "Map" sheet in the workbook.
 make_map = true
+# Coverage map: each postcode area is drawn as the land nearer its grid reference than any other area's,
+# clipped to the coast and to this many km around its grid reference (stops a lone area filling a big empty patch).
+map_area_cap_km = 30
 
 # Distance stage. Only active depots that are not closing take part in the nearest-depot test.
 tolerance_km = 15           # a depot is eligible only if it is at least this many km nearer than the next-nearest
