@@ -829,8 +829,8 @@ DEPOT_INFO_XY = {}   # every depot in the depot info file (closing ones too), fo
 def draw_coverage_map(result, depot_xy, xlsx_path):
     """Map of each depot and the postcode areas it covers: current depots beside the new assignment.
 
-    One dot per area at its grid reference, coloured by depot and sized by kg per day, with the area
-    letters beside it. Depots are stars. Flagged areas have a black ring. Saved as a PNG next to the
+    One dot per area at its grid reference, coloured by depot and sized by kg per day (no area labels,
+    so the coverage reads at a glance; the Assignment sheet lists every area). Depots are stars. Flagged areas have a black ring. Saved as a PNG next to the
     workbook and added to it as a "Map" sheet. The UK outline comes from MAP_IMAGE_PATH in .env, if set.
     """
     os.environ.setdefault("MAP_IMAGE_PATH", "")          # maps_common reads it at import
@@ -856,8 +856,6 @@ def draw_coverage_map(result, depot_xy, xlsx_path):
         if col == DEPOT and flagged.any():
             ax.scatter(pts.loc[flagged, EAST], pts.loc[flagged, NORTH], s=size[flagged] + 30,
                        facecolors="none", edgecolors="black", linewidths=0.9)
-        for a, e, n in zip(pts[AREA], pts[EAST], pts[NORTH]):
-            ax.annotate(a, (e, n), xytext=(4, 3), textcoords="offset points", fontsize=7, color="#333333")
         depots_here = [d for d in shown if d in set(pts[col])]
         for d in depots_here:
             if d in all_xy:
