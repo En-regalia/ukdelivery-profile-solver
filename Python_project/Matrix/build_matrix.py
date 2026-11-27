@@ -8,6 +8,8 @@ from pathlib import Path
 import pandas as pd
 import glob
 
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
 # ---- Settings -------------------------------------------------------------
 ORDERS_PATH = Path(os.environ["ORDERS_PATH"])
 DEPOT_ASSIGNED = Path(os.environ["DEPOT_ASSIGNED"])
