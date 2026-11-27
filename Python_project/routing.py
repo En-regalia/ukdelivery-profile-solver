@@ -136,14 +136,39 @@ def two_opt_loop(path, pts):
     return path
 
 
+def area_of(stop):
+    """Postcode district of a stop key: "SA1|SA1 1AA" -> "SA1"; a district key is its own district."""
+    return stop.split("|", 1)[0]
+
+
+_DISTRICT_ORDER = {}   # (depot position, frozenset of districts) -> district visiting order
+
+
+def district_order(points, depot_xy):
+    """Districts in visiting order (nearest neighbour then 2-opt), cached. points: district -> (x, y)."""
+    key = (depot_xy, frozenset(points))
+    if key not in _DISTRICT_ORDER:
+        pts = dict(points)
+        pts[DEPOT_KEY] = depot_xy
+        _DISTRICT_ORDER[key] = two_opt_loop(nearest_neighbour_loop(list(points), pts), pts)[1:-1]
+    return _DISTRICT_ORDER[key]
+
+
 def vehicle_route(areas, coords, depot_xy):
     """Closed route for one vehicle: depot -> stops -> depot.
+
+    areas: stop keys. A stop is a postcode district ("SA1", at its average grid reference) or
+    a delivery postcode in a district ("SA1|SA1 1AA", at the postcode's own point; see
+    postcodes.py). The route visits districts in the order of a nearest neighbour + 2-opt loop
+    over the district points (as before), and inside each district goes from the point it
+    arrived at to the nearest of that district's stops, then the next nearest, and so on.
+    With district stops only this is exactly the old district loop.
 
     Returns (order, route_km, stop_km, unlocated):
       order      depot, stops in visiting order, depot
       route_km   full loop, including both depot legs
       stop_km    stop-to-stop distance only (route_km minus the two depot legs)
-      unlocated  areas with no grid reference; left out of the route and listed
+      unlocated  stops with no grid reference; left out of the route and listed
                  so the totals are not silently low
     """
     unlocated = sorted({a for a in areas if a not in coords})
@@ -151,10 +176,30 @@ def vehicle_route(areas, coords, depot_xy):
     if not located:
         return [], 0.0, 0.0, unlocated
 
-    pts = dict(coords)
+    groups = {}
+    for s in located:
+        groups.setdefault(area_of(s), []).append(s)
+    points = {}
+    for d, members in groups.items():
+        if d in coords:
+            points[d] = coords[d]
+        else:   # no district centre: the middle of its stops
+            xs = [coords[s] for s in members]
+            points[d] = (sum(p[0] for p in xs) / len(xs), sum(p[1] for p in xs) / len(xs))
+
+    order = [DEPOT_KEY]
+    last = depot_xy
+    for d in district_order(points, depot_xy):
+        left = list(groups[d])
+        while left:
+            nxt = min(left, key=lambda s: grid_distance_km(last, coords[s]))
+            order.append(nxt)
+            last = coords[nxt]
+            left.remove(nxt)
+    order.append(DEPOT_KEY)
+
+    pts = {s: coords[s] for s in located}
     pts[DEPOT_KEY] = depot_xy
-    order = nearest_neighbour_loop(located, pts)
-    order = two_opt_loop(order, pts)
     stop_km = path_km(order[1:-1], pts) if len(located) > 1 else 0.0
     route_km = path_km(order, pts)
     return order, route_km, stop_km, unlocated

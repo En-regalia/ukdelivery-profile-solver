@@ -4,14 +4,23 @@ One workbook, Customer_report_<stamp>.xlsx, in the planning run folder:
   Customer summary   front sheet in plain words: before, after and change
   Summary            bottom, middle and top 10 weeks: average kg and pallets per weekday
   Origin split       weight each depot takes from other depots' regions
-  Vehicle mix        vans and trucks per depot and band, and the order size table
+  Order sizes        order sizes, and how postcode-area visits change
   Fill               average vehicle fill per depot and weekday against the target
   Detail - ...       analyst working sheets behind the front sheets
 
-Before = every order on its actual depot and day. After = every order on the depot
-whose plan holds its postcode area, on the area's new day. Both are packed the same
-way (planning_estimate.pack), so the comparison is like for like. Closing depots stay
-in "before" as a comparator.
+Before = what actually ran: the real routes (route IDs) in the raw orders file (ORDERS_PATH),
+Cancelled orders left out, in the same sample weeks. Vehicles = real routes; drops = orders;
+fill = each route's kg and pallets against the vehicle it needed (van, 18t or 26t); km = the
+straight-line loop through the route's delivery postcodes, as for "after".
+After = every order on the depot whose plan holds its postcode area, on the area's new day,
+packed by planning_estimate.pack. Closing depots stay in "before" as a comparator.
+If no actual routes are passed (ORDERS_PATH not set), "before" falls back to the planning
+orders packed the same way as "after".
+
+Fleet: on each "after" day where orders did not fit the fleet (fleet overflow, sent to the
+pallet network), planning_estimate packs the day again with 1, 2 ... extra 18t trucks. The
+report sets the pallets sent to the network ([cost] pallet_rate per pallet) against the extra
+trucks ([cost] extra_vehicle_day per truck per day).
 
 Settings: settings.toml [report], [cost], [data], [depots], [fleet], [vehicles].
 Each step's own Excel output (assignment, anneal, sweep, Example_weeks) is unchanged.
@@ -40,6 +49,9 @@ TYPES = ["Van", "HGV", "26t"]
 TRUCKS = ["HGV", "26t"]
 TYPE_NAME = {"Van": "Vans", "HGV": "18t HGVs", "26t": "26t HGVs"}
 FILL_TARGET = R["fill_target"]
+PALLET_RATE = C.get("pallet_rate", 70.0)          # cost per pallet sent on the pallet network
+VEHICLE_DAY = C.get("extra_vehicle_day", 550.0)   # cost of running one extra vehicle for a day
+VEHICLE_SPECS = SETTINGS["vehicles"]
 
 
 # ---- Data views -------------------------------------------------------------------------
@@ -54,10 +66,11 @@ def depot_status(depot):
 def order_view(O, plan):
     """Orders as delivered in one plan: Week, Depot, Day, area, kg, pal.
 
-    Before: actual depot and day. After: new depot and day; pallet-network orders left out.
+    Before: actual depot and day (O is then the actual orders). After: new depot and day;
+    pallet-network orders left out.
     """
     if plan == "Before":
-        v = O.rename(columns={"depot": "Depot", "day": "Day"})
+        v = O[O["day"].isin(DAYS)].rename(columns={"depot": "Depot", "day": "Day"})
     else:
         v = O[O["new_day"] != PALLET].rename(columns={"new_depot": "Depot", "new_day": "Day"})
     return v[["Week", "Depot", "Day", "area", "kg", "pal"]]
@@ -84,12 +97,13 @@ def old_patterns(orders_all):
 class Measures:
     """Service and efficiency measures for one scope (all depots or one depot) and plan."""
 
-    def __init__(self, O, V, drops, D, patterns, n_weeks):
+    def __init__(self, O, V, drops, D, patterns, n_weeks, O_before=None, actual=False):
         self.O, self.V, self.drops, self.D = O, V, drops, D
-        self.patterns, self.n_weeks = patterns, n_weeks
+        self.O_before = O if O_before is None else O_before
+        self.patterns, self.n_weeks, self.actual = patterns, n_weeks, actual
 
     def scope(self, plan, depot=None):
-        ov = order_view(self.O, plan)
+        ov = order_view(self.O_before if plan == "Before" else self.O, plan)
         v = self.V[self.V["Plan"] == plan]
         dr = self.drops[self.drops["Plan"] == plan]
         if depot is not None:
@@ -120,9 +134,9 @@ class Measures:
         m["dup_week"] = (visits - 1).clip(lower=0).sum() / self.n_weeks
         d = self.D if depot is None else self.D[self.D["Depot"] == depot]
         sfx = "before" if plan == "Before" else "after"
-        m["fleet_overflow_kg_week"] = d[f"Over fleet {sfx} KG"].sum() / self.n_weeks
-        m["routecap_overflow_kg_week"] = d[f"Over route cap {sfx} KG"].sum() / self.n_weeks
-        m["actual_routes_day"] = d["Routes before"].sum() / n_days if plan == "Before" else np.nan
+        real = plan == "Before" and self.actual     # actual routes: nothing was left over
+        m["fleet_overflow_kg_week"] = np.nan if real else d[f"Over fleet {sfx} KG"].sum() / self.n_weeks
+        m["routecap_overflow_kg_week"] = np.nan if real else d[f"Over route cap {sfx} KG"].sum() / self.n_weeks
         return m
 
 
@@ -131,19 +145,22 @@ MEASURES = [  # key, label, kind (pct / num / int), decimals, plain explanation
      "How many weekdays each postcode area receives a delivery, on average"),
     ("stability", "Volume delivered on one of the area's usual days", "pct", 1,
      "Share of kg delivered on a weekday the area already had in its pattern (service stability)"),
-    ("veh_day", "Vehicles per day", "num", 1, "Average vehicles used per working day, all depots"),
+    ("veh_day", "Vehicles per day", "num", 1,
+     "Average vehicles per working day, all depots. Before = real routes run"),
     ("veh_week", "Vehicles per week", "num", 1, "Vehicle-days per week (one vehicle used on one day = 1)"),
-    ("km_tonne", "Kilometres per tonne", "num", 1, "Route km driven per tonne delivered (lower is better)"),
+    ("km_tonne", "Kilometres per tonne", "num", 1,
+     "Straight-line route km per tonne delivered, same estimate before and after (lower is better)"),
     ("fill", "Average vehicle fill", "pct", 1,
      "Per vehicle, the higher of its kg fill and pallet fill; target shown below"),
-    ("drops_veh", "Drops per vehicle", "num", 1, "Postcode areas visited per vehicle"),
+    ("drops_veh", "Drops per vehicle", "num", 1, "Orders delivered per vehicle; every order is a drop"),
     ("multi_share", "Area-days served by more than one vehicle", "pct", 1,
      "Share of postcode-area days where two or more vehicles visit the same area"),
     ("dup_week", "Duplicate vehicle visits per week", "num", 1,
      "Extra visits to an area on a day it is already served by another vehicle"),
-    ("kg_week", "Weight delivered by vehicle per week (kg)", "int", 0, "Excludes the pallet network"),
+    ("kg_week", "Weight delivered by vehicle per week (kg)", "int", 0,
+     "Actual kg. After excludes the pallet network"),
     ("pal_week", "Pallets delivered by vehicle per week", "int", 0, "Excludes the pallet network"),
-    ("km_week", "Route km per week", "int", 0, "Straight-line km, depot to stops and back"),
+    ("km_week", "Route km per week", "int", 0, "Straight-line km, depot to each delivery postcode and back"),
 ]
 
 
@@ -215,18 +232,102 @@ def cost_rows(mb, ma, weeks):
 
 
 # ---- Fleet --------------------------------------------------------------------------------------
-def fleet_tables(V, D, n_weeks):
-    """Fleet allocation per active depot and type, with flags for review; plus the total fleet."""
+def extra_vehicle_table(D, days):
+    """Per active depot, after: days orders did not fit the fleet, what went to the pallet network,
+    the extra 18t trucks that would have carried it, and which is cheaper.
+
+    Per day: pallet network = fleet-overflow pallets x PALLET_RATE; extra trucks = trucks needed x
+    VEHICLE_DAY (only where planning_estimate found a number of extra trucks that clears the day).
+    Best mix = the cheaper of the two on each day. Orders over the route cap are listed apart: an
+    extra truck does not help them, as they are too far for any truck within the cap.
+    """
+    rows = []
+    n_days = len(days)
+    if D.empty:
+        return pd.DataFrame()
+    D = D.copy()
+    for col in ["Over fleet after pallets", "Over route cap after pallets", "Extra trucks needed after"]:
+        if col not in D.columns:
+            D[col] = np.nan
+    for depot in sorted(D["Depot"].unique()):
+        if not is_active(depot):
+            continue
+        d = D[D["Depot"] == depot]
+        short = d[d["Over fleet after orders"] > 0]
+        tight = d[(d["Fleet unresolved after"] > 0) & (d["Over fleet after orders"] == 0)]
+        pal = short["Over fleet after pallets"].fillna(0)
+        extra = short["Extra trucks needed after"]
+        cleared = extra.notna()
+        cost_pal = pal * PALLET_RATE
+        cost_veh = extra.fillna(0) * VEHICLE_DAY
+        veh_cheaper = cleared & (cost_veh < cost_pal)
+        best = np.where(veh_cheaper, cost_veh, cost_pal)
+        counts = extra[cleared].astype(int).value_counts().sort_index()
+        need = ", ".join(f"{k} extra on {v} day{'s' if v != 1 else ''}" for k, v in counts.items())
+        if (~cleared).any():
+            n = int((~cleared).sum())
+            need += (", " if need else "") + f"more than {EXTRA_MAX} on {n} day{'s' if n != 1 else ''}"
+        rows.append({
+            "Depot": depot,
+            "Days with orders left over": len(short),
+            "Days %": len(short) / n_days if n_days else None,
+            "Weeks affected": short["Week"].nunique(),
+            "Extra 18t trucks needed": need or "None",
+            "Extra truck-days (sample)": int(extra.fillna(0).sum()),
+            "KG to pallet network (fleet)": round(short["Over fleet after KG"].sum()),
+            "Pallets to pallet network (fleet)": round(pal.sum(), 1),
+            "Pallet network cost (£)": round(cost_pal.sum()),
+            "Extra trucks cost (£)": round(cost_veh[cleared].sum() + cost_pal[~cleared].sum()),
+            "Days an extra truck is cheaper": int(veh_cheaper.sum()),
+            "Best mix cost (£)": round(best.sum()),
+            "Best mix per week (£)": round(best.sum() / max(d["Week"].nunique(), 1)),
+            "Tight days (all fitted)": len(tight),
+            "KG over route cap (pallet network)": round(d["Over route cap after KG"].sum()),
+            "Pallets over route cap": round(d["Over route cap after pallets"].fillna(0).sum(), 1),
+        })
+    return pd.DataFrame(rows)
+
+
+EXTRA_MAX = R.get("max_extra_vehicles", 3)
+
+
+def extra_summary(row, n_days, n_weeks):
+    """Plain-words cells for the customer summary depot table, from one extra_vehicle_table row."""
+    if row is None or not row["Days with orders left over"]:
+        return "Fits the fleet every day", "None", ""
+    need = (f"{row['Extra 18t trucks needed']} (of {n_days} days, in {row['Weeks affected']} "
+            f"of {n_weeks} weeks)")
+    sent = f"{row['Pallets to pallet network (fleet)']:,.0f} pallets / {row['KG to pallet network (fleet)']:,.0f} kg"
+    cur = C.get("currency", "£")
+    if row["Days an extra truck is cheaper"] == 0:
+        cheaper = f"Pallet network ({cur}{row['Pallet network cost (£)']:,.0f} over the sample)"
+    elif row["Days an extra truck is cheaper"] == row["Days with orders left over"]:
+        cheaper = f"Extra truck ({cur}{row['Extra trucks cost (£)']:,.0f} against {cur}{row['Pallet network cost (£)']:,.0f} pallets)"
+    else:
+        cheaper = (f"Extra truck on {row['Days an extra truck is cheaper']} days, pallets on the rest "
+                   f"({cur}{row['Best mix cost (£)']:,.0f} over the sample)")
+    return need, sent, cheaper
+
+
+def fleet_tables(V, D, n_weeks, extra=None):
+    """Fleet allocation per active depot and type, with flags for review; plus the total fleet.
+
+    PXX used: the vehicles used on the XXth percentile day (allocation_spare_pct): XX% of the sample
+    days needed that many or fewer. "Spare" when the cap is at least one above it.
+    "Short" (trucks): days on which some orders did not fit the fleet and went to the pallet network.
+    """
     caps = fleet_caps()
     after = V[V["Plan"] == "After"]
     days = [(w, d) for w in sorted(V["Week"].unique()) for d in DAYS]
+    ex = extra.set_index("Depot") if extra is not None and not extra.empty else None
     rows = []
     depots = sorted(set(after["Depot"]) | {d for d in caps if is_active(d)})
+    pname = f"P{int(R['allocation_spare_pct'] * 100)} used"
     for depot in depots:
         if not is_active(depot):
             continue
         dd = D[D["Depot"] == depot]
-        short_days = ((dd["Fleet unresolved after"] > 0) | (dd["Over fleet after orders"] > 0)).sum()
+        short_days = int((dd["Over fleet after orders"] > 0).sum())
         short_share = short_days / len(days) if days else 0
         for t in TYPES:
             cap = caps.get(depot, {}).get(t)
@@ -238,16 +339,17 @@ def fleet_tables(V, D, n_weeks):
             spare = (cap - int(np.ceil(q))) if cap is not None else None
             if cap is None:
                 flag = "No cap set"
-            elif t in TRUCKS and short_share >= R["allocation_short_share"]:
-                flag = f"Short on {short_share:.0%} of days: consider adding"
+            elif t in TRUCKS and short_days:
+                need = ex.at[depot, "Extra 18t trucks needed"] if ex is not None and depot in ex.index else ""
+                flag = f"Short on {short_days} days ({short_share:.0%}): {need}"
             elif spare is not None and spare >= 1 and (t != "Van" or cap > 0):
                 flag = f"Spare: {spare} could be released"
             else:
                 flag = "Within allocation"
             rows.append({"Depot": depot, "Vehicle type": TYPE_NAME[t], "Cap per day": cap,
-                         "Average used": round(used.mean(), 2), f"P{int(R['allocation_spare_pct'] * 100)} used": round(q, 1),
+                         "Average used": round(used.mean(), 2), pname: round(q, 1),
                          "Most used": int(used.max()), "Days at cap %": (used >= cap).mean() if cap else None,
-                         "Days short of fleet %": short_share if t in TRUCKS else None,
+                         "Days with orders left over %": short_share if t in TRUCKS else None,
                          "Flag (for review, not applied)": flag})
     alloc = pd.DataFrame(rows)
 
@@ -268,6 +370,26 @@ def fleet_tables(V, D, n_weeks):
                     "Average used before": round(ub.mean(), 2), "Most used before": int(ub.max()),
                     "Average used after": round(ua.mean(), 2), "Most used after": int(ua.max())})
     return alloc, pd.DataFrame(tot)
+
+
+def actual_vehicles(actual_routes, actual_orders):
+    """Real routes as vehicle rows (Plan "Before"), in the same columns as planning_estimate.vehicle_rows."""
+    lo = actual_orders[actual_orders["day"].isin(DAYS)]
+    g = (lo.groupby(["wk", "depot", "day", "route", "area"])
+         .agg(kg=("kg", "sum"), pal=("pal", "sum"), n=("kg", "size")))
+    loads = {}
+    for (wk, dep, day, route, area), kg, pal, n in zip(g.index, g["kg"], g["pal"], g["n"]):
+        loads.setdefault((wk, dep, day, route), {})[area] = (kg, pal, int(n))
+    rows = []
+    for r in actual_routes:
+        t = r["_fill_type"]
+        sp = VEHICLE_SPECS[t]
+        rows.append({"Week": r["Week"], "Depot": r["Depot"], "Day": r["Day"], "Plan": "Before",
+                     "Vehicle": r["Route"], "Type": t, "KG": r["KG"], "Pallets": r["Pallets"],
+                     "KG fill %": r["KG"] / sp["kg"], "Pallet fill %": r["Pallets"] / sp["pallets"],
+                     "Route km": r["Route km"], "Drops": r["Drops"],
+                     "Loads": loads.get((r["Week"], r["Depot"], r["Day"], r["Route"]), {})})
+    return rows
 
 
 # ---- Workbook helpers -----------------------------------------------------------------------------
@@ -355,11 +477,11 @@ def money_fmt():
 
 
 # ---- Sheets ----------------------------------------------------------------------------------------
-def band_summary(O, band_of):
-    """Average kg and pallets per weekday, by band, depot and plan."""
+def band_summary(O, band_of, O_before=None):
+    """Average kg and pallets per weekday, by band, depot and plan. Before from O_before (actual orders)."""
     rows = []
     for plan in ["Before", "After"]:
-        ov = order_view(O, plan)
+        ov = order_view(O if plan == "After" or O_before is None else O_before, plan)
         if plan == "After":   # show the pallet network as its own line
             pn = O[O["new_day"] == PALLET].rename(columns={"depot": "Depot", "day": "Day"})
             pn = pn.assign(Depot=PALLET)[["Week", "Depot", "Day", "area", "kg", "pal"]]
@@ -413,30 +535,11 @@ def origin_split(O, n_weeks):
     return t1, t2, cols
 
 
-def vehicle_mix(V, band_of):
-    rows = []
-    Vb = V.assign(Band=V["Week"].map(band_of))
-    for band in BANDS:
-        b = Vb[Vb["Band"] == band]
-        n = b["Week"].nunique() or 1
-        for depot in [ALL] + sorted(b["Depot"].unique()):
-            g = b if depot == ALL else b[b["Depot"] == depot]
-            for plan in ["Before", "After"]:
-                p = g[g["Plan"] == plan]
-                rec = {"Band": band, "Depot": depot, "Plan": plan}
-                for t in TYPES:
-                    q = p[p["Type"] == t]
-                    rec[f"{TYPE_NAME[t]} per week"] = round(len(q) / n, 1)
-                for t in TYPES:
-                    q = p[p["Type"] == t]
-                    rec[f"{TYPE_NAME[t]} kg per week"] = round(q["KG"].sum() / n)
-                    rec[f"{TYPE_NAME[t]} pallets per week"] = round(q["Pallets"].sum() / n, 1)
-                rows.append(rec)
-    return pd.DataFrame(rows)
-
-
 def size_table(O, drops, n_weeks):
-    """Order sizes, and drop sizes before and after: how condensing changes small deliveries."""
+    """Order sizes, and area-visit sizes before and after: how condensing changes small deliveries.
+
+    An area visit is all of one postcode area's orders on one vehicle (each order is still its own drop).
+    """
     edges = [0] + list(R["order_size_bands_kg"]) + [np.inf]
     labels = [f"{int(a):,} to {int(b):,} kg" if b != np.inf else f"Over {int(a):,} kg"
               for a, b in zip(edges, edges[1:])]
@@ -453,16 +556,16 @@ def size_table(O, drops, n_weeks):
     for plan in ["Before", "After"]:
         d = drops[drops["Plan"] == plan]
         dc = bands(d["kg"]).value_counts().reindex(labels, fill_value=0)
-        t[f"Drops per week {plan.lower()}"] = (dc.values / n_weeks).round(1)
-        t[f"Drops % {plan.lower()}"] = dc.values / max(dc.sum(), 1)
+        t[f"Area visits per week {plan.lower()}"] = (dc.values / n_weeks).round(1)
+        t[f"Area visits % {plan.lower()}"] = dc.values / max(dc.sum(), 1)
     small = R["small_order_kg"]
     summary = []
     for plan in ["Before", "After"]:
         d = drops[drops["Plan"] == plan]
-        summary.append({"Plan": plan, "Drops per week": round(len(d) / n_weeks, 1),
-                        "Orders per drop": round(d["orders"].sum() / len(d), 2) if len(d) else None,
-                        "Average drop kg": round(d["kg"].mean(), 0) if len(d) else None,
-                        f"Drops up to {small:,} kg %": (d["kg"] <= small).mean() if len(d) else None})
+        summary.append({"Plan": plan, "Area visits per week": round(len(d) / n_weeks, 1),
+                        "Orders per area visit": round(d["orders"].sum() / len(d), 2) if len(d) else None,
+                        "Average area visit kg": round(d["kg"].mean(), 0) if len(d) else None,
+                        f"Area visits up to {small:,} kg %": (d["kg"] <= small).mean() if len(d) else None})
     return t, pd.DataFrame(summary)
 
 
@@ -532,20 +635,36 @@ def settings_rows(d=None, prefix=""):
 
 
 # ---- Build ---------------------------------------------------------------------------------------------
-def build(run_dir, stamp, band_of, vehicles, orders_sim, daily, orders_all, plan_source):
-    """Write Customer_report_<stamp>.xlsx. Returns its path."""
+def build(run_dir, stamp, band_of, vehicles, orders_sim, daily, orders_all, plan_source,
+          actual_routes=None, actual_orders=None):
+    """Write Customer_report_<stamp>.xlsx. Returns its path.
+
+    actual_routes / actual_orders: real routes (planning_estimate.actual_route_rows) and orders of the
+    raw orders file in the sample weeks. Given, they are "before"; else the simulated before is used.
+    """
     V = pd.DataFrame(vehicles)
+    actual = actual_routes is not None and actual_orders is not None and len(actual_routes) > 0
+    O_before = None
+    if actual:
+        V = pd.concat([V[V["Plan"] == "After"], pd.DataFrame(actual_vehicles(actual_routes, actual_orders))],
+                      ignore_index=True)
+        O_before = actual_orders.rename(columns={"wk": "Week"})
     O = orders_sim.copy()
     D = pd.DataFrame(daily)
     weeks = sorted(band_of)
     n_weeks = len(weeks)
+    n_days = n_weeks * len(DAYS)
     drops = drop_table(V)
     patterns = old_patterns(orders_all)
-    M = Measures(O, V, drops, D, patterns, n_weeks)
+    M = Measures(O, V, drops, D, patterns, n_weeks, O_before, actual)
     mb, ma = M.get("Before"), M.get("After")
     cost, cost_method = cost_rows(mb, ma, weeks)
-    alloc, total_fleet = fleet_tables(V, D, n_weeks)
+    extra = extra_vehicle_table(D, [(w, d) for w in weeks for d in DAYS])
+    alloc, total_fleet = fleet_tables(V, D, n_weeks, extra)
     t_origin, t_dest, dest_cols = origin_split(O, n_weeks)
+    before_source = ("Before = the real routes that ran (raw orders file, Cancelled orders left out)."
+                     if actual else
+                     "Before = the planning orders packed onto vehicles (no raw orders file set, ORDERS_PATH).")
 
     wb = Workbook()
 
@@ -556,7 +675,7 @@ def build(run_dir, stamp, band_of, vehicles, orders_sim, daily, orders_all, plan
     dates = sample_dates(weeks)
     s.text(f"Order data as at {SETTINGS['data']['source_date']}. "
            f"Sample: {n_weeks} weeks ({min(dates):%d %b %Y} to {max(dates):%d %b %Y}): the 10 lightest, "
-           f"10 middle and 10 busiest weeks by weight.", italic=True)
+           f"10 middle and 10 busiest weeks by weight. {before_source}", italic=True)
     s.gap()
 
     rows = []
@@ -577,36 +696,46 @@ def build(run_dir, stamp, band_of, vehicles, orders_sim, daily, orders_all, plan
 
     # depot table
     caps = fleet_caps()
-    flags = alloc.groupby("Depot")["Flag (for review, not applied)"].agg(
-        lambda x: "; ".join(sorted({f for f in x if f != "Within allocation"})) or "Within allocation") \
-        if not alloc.empty else pd.Series(dtype=str)
+    ex = {r["Depot"]: r for r in extra.to_dict("records")} if not extra.empty else {}
     drow = []
     for depot in sorted(set(V["Depot"])):
         b, a = M.get("Before", depot), M.get("After", depot)
         cap = caps.get(depot)
+        need, sent, cheaper = extra_summary(ex.get(depot), n_days, n_weeks) if is_active(depot) else ("", "", "")
         drow.append({"Depot": depot, "Status": depot_status(depot),
                      "KG per week before": round(b["kg_week"]), "KG per week after": round(a["kg_week"]),
                      "Change %": (a["kg_week"] / b["kg_week"] - 1) if b["kg_week"] else None,
                      "Vehicles per day before": round(b["veh_day"], 1),
                      "Vehicles per day after": round(a["veh_day"], 1),
                      "Fleet per day": sum(cap.values()) if cap and is_active(depot) else None,
-                     "Average fill after": a["fill"],
-                     "Fleet allocation (for review)": flags.get(depot, "") if is_active(depot) else ""})
-    s.table(pd.DataFrame(drow), pct=("Change %", "Average fill after"), num1=("Vehicles per day before", "Vehicles per day after"),
+                     "Drops per vehicle before": round(b["drops_veh"], 1) if pd.notna(b["drops_veh"]) else None,
+                     "Drops per vehicle after": round(a["drops_veh"], 1) if pd.notna(a["drops_veh"]) else None,
+                     "Fill before": b["fill"], "Fill after": a["fill"],
+                     "Extra vehicles needed (after)": need,
+                     "Sent to pallet network (fleet, sample)": sent,
+                     f"Cheaper: {C.get('currency', '£')}{PALLET_RATE:,.0f}/pallet or "
+                     f"{C.get('currency', '£')}{VEHICLE_DAY:,.0f}/truck-day": cheaper})
+    s.table(pd.DataFrame(drow), pct=("Change %", "Fill before", "Fill after"),
+            num1=("Vehicles per day before", "Vehicles per day after",
+                  "Drops per vehicle before", "Drops per vehicle after"),
             heading="By depot")
 
     s.title("In plain words", size=11)
-    for line in plain_words(M, mb, ma, t_dest, dest_cols, n_weeks, cost):
+    for line in plain_words(M, mb, ma, t_dest, dest_cols, n_weeks, cost, extra):
         s.text("• " + line)
     s.gap()
     s.title("How these figures are measured", size=11)
     for line in [
-        "Before: each order on its current depot and delivery day. After: each order on its new depot and "
-        "the postcode area's new day. Both are packed onto vehicles the same way, so the comparison is like for like.",
-        "Visits, drops and days are measured by postcode area, not by delivery site. Two customers in the same "
-        "postcode area on one vehicle count as one drop.",
-        "Kilometres are straight-line distances, depot to stops and back. Road distances are longer; use the "
-        "figures to compare before and after, not as mileage.",
+        "Before: the real routes that ran in the sample weeks, from the raw orders file, Cancelled orders left out "
+        "(vehicles = routes, actual kg, drops = orders). After: each order on its new depot and the postcode "
+        "area's new day, packed onto vehicles by the planner.",
+        "Every order is a drop: three orders in SA3 on one vehicle are three drops. Days per area and "
+        "duplicate visits are measured by postcode area.",
+        "Kilometres are straight-line distances, depot to each delivery postcode and back, worked out the same "
+        "way before and after. Road distances are longer; use the figures to compare, not as mileage.",
+        f"Extra vehicles: on days where orders did not fit the fleet, the day was planned again with up to "
+        f"{EXTRA_MAX} extra 18t trucks. Cost compares {C.get('currency', '£')}{PALLET_RATE:,.0f} per pallet on "
+        f"the pallet network against {C.get('currency', '£')}{VEHICLE_DAY:,.0f} per extra truck per day.",
         f"Fill is the higher of each vehicle's weight fill and pallet fill. Target {FILL_TARGET:.0%}.",
         f"A postcode area's usual days are the weekdays that carried at least {R['old_pattern_min_share']:.0%} "
         "of its weight across the order file.",
@@ -623,7 +752,7 @@ def build(run_dir, stamp, band_of, vehicles, orders_sim, daily, orders_all, plan
     s.text("Averages per week within each band. After = new depot and new day; the pallet network is shown "
            "as its own line and is not in 'All depots'.", italic=True)
     s.gap()
-    s.table(band_summary(O, band_of))
+    s.table(band_summary(O, band_of, O_before))
     s.finish(freeze="A4")
 
     # ---- 3. Origin split ----
@@ -636,18 +765,16 @@ def build(run_dir, stamp, band_of, vehicles, orders_sim, daily, orders_all, plan
     s.table(t_dest, pct=tuple(dest_cols), heading="Where each depot's current volume goes (share of its volume)")
     s.finish()
 
-    # ---- 4. Vehicle mix ----
-    s = Sheet(wb, "Vehicle mix", tab="1F4E79")
-    s.title("Vans and HGVs per depot, before and after")
-    s.text("Average per week in each band. 18t HGVs are upgraded to 26t only when that saves a truck.", italic=True)
-    s.gap()
-    s.table(vehicle_mix(V, band_of))
+    # ---- 4. Order sizes ----
+    s = Sheet(wb, "Order sizes", tab="1F4E79")
     sizes, size_sum = size_table(O, drops, n_weeks)
-    s.title("Order sizes, and how condensing changes them", size=11)
-    s.text("Orders are unchanged by the plan. A drop is all of one postcode area's orders on one vehicle: "
-           "with fewer delivery days, small orders combine into larger drops.", italic=True)
-    s.table(sizes, pct=("Orders %", "Drops % before", "Drops % after"))
-    s.table(size_sum, pct=tuple(c for c in size_sum.columns if c.endswith("%")), num2=("Orders per drop",))
+    s.title("Order sizes, and how condensing changes them")
+    s.text("Orders are unchanged by the plan, and each order is a drop. An area visit is all of one postcode "
+           "area's orders on one vehicle: with fewer delivery days, small orders combine into larger visits.",
+           italic=True)
+    s.gap()
+    s.table(sizes, pct=("Orders %", "Area visits % before", "Area visits % after"))
+    s.table(size_sum, pct=tuple(c for c in size_sum.columns if c.endswith("%")), num2=("Orders per area visit",))
     s.finish()
 
     # ---- 5. Fill ----
@@ -669,8 +796,7 @@ def build(run_dir, stamp, band_of, vehicles, orders_sim, daily, orders_all, plan
         for key, label, kind, dec, note in MEASURES + [
                 ("kg_fill", "KG fill", "pct", 1, ""), ("pal_fill", "Pallet fill", "pct", 1, ""),
                 ("fleet_overflow_kg_week", "KG per week over fleet (to pallet network)", "int", 0, ""),
-                ("routecap_overflow_kg_week", "KG per week over route cap (to pallet network)", "int", 0, ""),
-                ("actual_routes_day", "Actual routes per day (reference)", "num", 1, "")]:
+                ("routecap_overflow_kg_week", "KG per week over route cap (to pallet network)", "int", 0, "")]:
             rows.append({"Depot": depot or ALL, "Measure": label, "Before": b[key], "After": a[key],
                          "Change": change(b[key], a[key], kind), "_kind": kind})
     _write_measure_table(s, pd.DataFrame(rows), None, depot_col=True)
@@ -680,12 +806,27 @@ def build(run_dir, stamp, band_of, vehicles, orders_sim, daily, orders_all, plan
     s.title("DETAIL (working): fleet allocation, for review")
     s.text("Flags suggest where vehicles could move between depots. Nothing is moved automatically: "
            "moves are a planning decision.", italic=True)
-    s.text(f"Short: needed more trucks than the cap on at least {R['allocation_short_share']:.0%} of days. "
-           f"Spare: the cap is at least one vehicle above use on the "
-           f"{R['allocation_spare_pct']:.0%} busiest-day level.", italic=True)
+    pname = f"P{int(R['allocation_spare_pct'] * 100)}"
+    s.text(f"{pname} used: the vehicles used on the {R['allocation_spare_pct']:.0%} day, i.e. on "
+           f"{R['allocation_spare_pct']:.0%} of the {n_days} sample days the depot used this many or fewer. "
+           f"Spare: the cap is at least one vehicle above it, so one could be released.", italic=True)
+    s.text("Short: days on which some orders did not fit the trucks available and went to the pallet network. "
+           "The planner never plans more vehicles than the cap, so 'after' vehicles always look within the cap; "
+           "the orders that did not fit are what this measures.", italic=True)
     s.gap()
     s.table(total_fleet, heading="Total fleet: sum of per-depot caps (closing depots excluded after)")
-    s.table(alloc, pct=("Days at cap %", "Days short of fleet %"), heading="By depot and vehicle type (after)")
+    s.table(alloc, pct=("Days at cap %", "Days with orders left over %"), heading="By depot and vehicle type (after)")
+    cur = C.get("currency", "£")
+    s.title("Extra vehicles or pallet network", size=11)
+    s.text(f"Each day with orders left over was planned again with 1 to {EXTRA_MAX} extra 18t trucks; the fewest "
+           f"that carry everything is the extra trucks needed. Pallet network {cur}{PALLET_RATE:,.0f} per pallet; "
+           f"extra truck {cur}{VEHICLE_DAY:,.0f} per day ([cost] pallet_rate, extra_vehicle_day). Best mix takes the "
+           f"cheaper on each day. A day {EXTRA_MAX} extra trucks do not clear is costed at the pallet network.",
+           italic=True)
+    s.text("Tight days: the trucks only fitted after stretching the added-km limit or merging trucks; nothing "
+           "was left over. Orders over the route cap are too far for any truck within the cap, so an extra truck "
+           "does not help them; they are listed apart.", italic=True)
+    s.table(extra, pct=("Days %",), heading="By depot (after, sample weeks)")
     s.finish()
 
     s = Sheet(wb, "Detail - Cost", tab="808080")
@@ -695,11 +836,21 @@ def build(run_dir, stamp, band_of, vehicles, orders_sim, daily, orders_all, plan
         cur = C.get("currency", "£")
         crow = [{"Item": f"Budget for the sample ({cur})", "Before": cost["cost_sample"][0], "After": cost["cost_sample"][1]},
                 {"Item": f"Cost per kg ({cur})", "Before": cost["cost_kg"][0], "After": cost["cost_kg"][1]},
-                {"Item": f"Cost per pallet ({cur})", "Before": cost["cost_pallet"][0], "After": cost["cost_pallet"][1]},
-                {"Item": "KG on vehicles in the sample", "Before": mb["kg_week"] * n_weeks, "After": ma["kg_week"] * n_weeks},
-                {"Item": "Pallets on vehicles in the sample", "Before": mb["pal_week"] * n_weeks, "After": ma["pal_week"] * n_weeks}]
+                {"Item": f"Cost per pallet ({cur})", "Before": cost["cost_pallet"][0], "After": cost["cost_pallet"][1]}]
+        qrow = [{"Item": "KG on vehicles in the sample", "Before": mb["kg_week"] * n_weeks, "After": ma["kg_week"] * n_weeks},
+                {"Item": "Pallets on vehicles in the sample", "Before": mb["pal_week"] * n_weeks, "After": ma["pal_week"] * n_weeks},
+                {"Item": "Vehicle-days per week", "Before": mb["veh_week"], "After": ma["veh_week"]},
+                {"Item": "Route km per week", "Before": mb["km_week"], "After": ma["km_week"]}]
+        s.text(before_source, italic=True)
         s.gap()
         s.table(pd.DataFrame(crow), money=("Before", "After"))
+        s.table(pd.DataFrame(qrow), num1=("Before", "After"), heading="Basis")
+    if not extra.empty:
+        s.table(extra[["Depot", "Days with orders left over", "Extra truck-days (sample)",
+                       "Pallets to pallet network (fleet)", "Pallet network cost (£)", "Extra trucks cost (£)",
+                       "Best mix cost (£)", "Best mix per week (£)"]],
+                heading=f"Orders that did not fit the fleet (after): {cur}{PALLET_RATE:,.0f} per pallet against "
+                        f"{cur}{VEHICLE_DAY:,.0f} per extra truck-day; see Detail - Fleet allocation")
     s.finish()
 
     s = Sheet(wb, "Detail - Step outputs", tab="808080")
@@ -757,7 +908,7 @@ def _write_measure_table(s, df, heading, depot_col=False):
     s.gap()
 
 
-def plain_words(M, mb, ma, t_dest, dest_cols, n_weeks, cost):
+def plain_words(M, mb, ma, t_dest, dest_cols, n_weeks, cost, extra=None):
     lines = []
     for depot in CLOSING_DEPOTS:
         row = t_dest[t_dest["From depot"] == depot]
@@ -776,11 +927,19 @@ def plain_words(M, mb, ma, t_dest, dest_cols, n_weeks, cost):
     lines.append(f"{ma['stability']:.0%} of the weight is delivered on a day the area already has today "
                  f"({mb['stability']:.0%} now).")
     lines.append(f"Vehicles per day: {ma['veh_day']:.1f} against {mb['veh_day']:.1f} now; "
-                 f"{ma['drops_veh']:.1f} drops per vehicle against {mb['drops_veh']:.1f}.")
+                 f"{ma['drops_veh']:.1f} drops (orders) per vehicle against {mb['drops_veh']:.1f}.")
     lines.append(f"Average fill {ma['fill']:.0%} against {mb['fill']:.0%} now (target {FILL_TARGET:.0%}).")
     lines.append(f"Kilometres per tonne: {ma['km_tonne']:.1f} against {mb['km_tonne']:.1f} now.")
     lines.append(f"Areas visited by more than one vehicle on the same day: {ma['multi_share']:.0%} of area-days, "
                  f"against {mb['multi_share']:.0%} now.")
+    if extra is not None and not extra.empty:
+        cur = C.get("currency", "£")
+        for r in extra.to_dict("records"):
+            if r["Days with orders left over"]:
+                lines.append(f"{r['Depot']}: on {r['Days with orders left over']} of {n_weeks * len(DAYS)} days some "
+                             f"orders did not fit its trucks ({r['Pallets to pallet network (fleet)']:,.0f} pallets over "
+                             f"the sample); {r['Extra 18t trucks needed']}. Cheapest cover {cur}"
+                             f"{r['Best mix per week (£)']:,.0f} a week.")
     if cost:
         cur = C.get("currency", "£")
         lines.append(f"Estimated cost per kg {cur}{cost['cost_kg'][1]:.3f} against {cur}{cost['cost_kg'][0]:.3f} now; "
